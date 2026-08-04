@@ -4,6 +4,12 @@ import pytest
 from zerolab.converter import ConvertedPoseFrame, ZeroLabMotionConverter
 from zerolab.protocol import ZeroLabPacket
 from zerolab.source_node import PoseChunkWindow, ZeroLabSourceCore
+from pico.pose_to_smpl_ref_bridge import (
+    PicoSourceReadinessGate,
+    _decode_packed_message,
+    _parse_incoming_chunk,
+)
+from pico.zmq_messages import pack_pose_message
 
 
 def converted(index, *, dtype=np.float32):
@@ -174,3 +180,23 @@ def test_stale_gap_during_calibration_restarts_the_hundred_frame_rest_window():
     np.testing.assert_array_equal(
         fields["frame_index"], np.arange(150, 160, dtype=np.int64)
     )
+
+
+def test_existing_bridge_accepts_three_progressing_zerolab_chunks():
+    gate = PicoSourceReadinessGate(required_consecutive=3)
+    ready = []
+    for offset in range(3):
+        window = PoseChunkWindow(10)
+        fields = None
+        for index in range(offset, offset + 10):
+            fields = window.append(converted(index))
+        message = pack_pose_message(fields, topic="pose")
+        decoded = _decode_packed_message(message, "pose")
+        incoming = _parse_incoming_chunk(decoded)
+        assert incoming.term1_local.shape == (10, 72)
+        assert incoming.root_quat.shape == (10, 4)
+        assert incoming.wrist.shape == (10, 6)
+        ready.append(
+            gate.observe(decoded, now_mono=offset * 0.02, stale_seconds=0.5)
+        )
+    assert ready == [False, False, True]
