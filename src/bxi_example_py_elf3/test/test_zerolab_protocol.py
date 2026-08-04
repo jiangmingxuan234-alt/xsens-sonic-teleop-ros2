@@ -8,17 +8,18 @@ from zerolab.protocol import PACKET_SIZE, ZeroLabProtocolError, parse_zerolab_pa
 
 def make_payload():
     root = np.array([1.25, -2.5, 3.75], dtype="<f4")
-    quats = np.zeros((47, 4), dtype="<f4")
-    quats[:, 3] = 2.0
+    quats = (
+        np.arange(1, 189, dtype=np.float32).reshape(47, 4) / 10
+    ).astype("<f4")
     left = np.arange(100, 106, dtype="<u2")
     right = np.arange(200, 206, dtype="<u2")
     positions = (np.arange(51, dtype=np.float32).reshape(17, 3) / 10).astype("<f4")
     payload = root.tobytes() + quats.tobytes() + left.tobytes() + right.tobytes() + positions.tobytes()
-    return payload, root, left, right, positions
+    return payload, root, quats, left, right, positions
 
 
 def test_exact_packet_parses_all_documented_offsets():
-    payload, root, left, right, positions = make_payload()
+    payload, root, quats, left, right, positions = make_payload()
     packet = parse_zerolab_packet(
         payload,
         receive_timestamp_ns=123456789,
@@ -27,7 +28,9 @@ def test_exact_packet_parses_all_documented_offsets():
     )
     assert len(payload) == PACKET_SIZE == 992
     np.testing.assert_array_equal(packet.root_translation, root)
-    np.testing.assert_allclose(packet.joint_quat_world_xyzw[:, 3], 2.0)
+    np.testing.assert_array_equal(packet.joint_quat_world_xyzw, quats)
+    assert packet.joint_quat_world_xyzw.shape == (47, 4)
+    assert packet.joint_quat_world_xyzw.dtype == np.float32
     np.testing.assert_array_equal(packet.left_hand_values, left)
     np.testing.assert_array_equal(packet.right_hand_values, right)
     np.testing.assert_array_equal(packet.joint_position, positions)
