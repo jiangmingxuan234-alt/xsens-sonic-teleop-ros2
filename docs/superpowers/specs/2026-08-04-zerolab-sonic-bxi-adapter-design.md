@@ -205,11 +205,17 @@ On entry to the ZeroLab state:
 1. Set calibration_ready to false.
 2. Clear the 10-frame output buffer.
 3. Collect 100 consecutive valid body frames while the subject holds T-pose.
-4. Align quaternion signs within the calibration window.
-5. Compute a normalized mean rest quaternion for each of the 17 body joints.
-6. If a calibration frame differs by more than five degrees from the running
-   rest estimate for any body joint, restart the 100-frame window.
-7. Store the resulting rest rotations for the current state session.
+4. Normalize each incoming frame and align its quaternion signs against the
+   previous accepted calibration frame.
+5. Append the aligned frame to a candidate window, then compute the normalized
+   component mean for each of the 17 body joints over that candidate.
+6. Compute quaternion angular distance from every candidate frame, for every
+   joint, to that candidate mean. If any distance is strictly greater than five
+   degrees, discard the old window and retain the current frame as frame one of
+   a new window; equality does not restart calibration. Otherwise accept the
+   entire candidate window.
+7. At exactly 100 accepted frames, store the already-validated candidate mean
+   as the rest rotations for the current state session.
 8. Collect 10 new post-calibration frames before publishing a ready pose chunk.
 9. Do not automatically recalibrate during the session. Leaving and re-entering
    the state starts a new calibration.

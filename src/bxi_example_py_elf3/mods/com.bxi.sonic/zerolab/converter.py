@@ -127,27 +127,22 @@ class TPoseCalibrator:
 
         previous = self._window[-1] if self._window else None
         frame = align_quaternion_signs(frame, previous)
-        if self._window:
-            mean = _normalize_quaternions(
-                np.mean(self._window, axis=0, dtype=np.float64),
-                _BODY_QUATERNION_SHAPE,
-            )
-            dots = np.sum(frame * mean, axis=1)
-            angular_distances = np.degrees(
-                2.0 * np.arccos(np.clip(np.abs(dots), 0.0, 1.0))
-            )
-            if np.any(angular_distances > self._max_deviation_degrees):
-                self._window = [frame]
-            else:
-                self._window.append(frame)
+        candidate = self._window + [frame]
+        mean = _normalize_quaternions(
+            np.mean(candidate, axis=0, dtype=np.float64),
+            _BODY_QUATERNION_SHAPE,
+        )
+        dots = np.sum(np.asarray(candidate) * mean, axis=2)
+        angular_distances = np.degrees(
+            2.0 * np.arccos(np.clip(np.abs(dots), 0.0, 1.0))
+        )
+        if np.any(angular_distances > self._max_deviation_degrees):
+            self._window = [frame]
         else:
-            self._window.append(frame)
+            self._window = candidate
 
         if len(self._window) == self._required_frames:
-            self._rest_quats_xyzw = _normalize_quaternions(
-                np.mean(self._window, axis=0, dtype=np.float64),
-                _BODY_QUATERNION_SHAPE,
-            )
+            self._rest_quats_xyzw = mean
             return True
         return False
 

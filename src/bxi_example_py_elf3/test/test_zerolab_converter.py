@@ -92,13 +92,19 @@ def test_motion_over_five_degrees_restarts_calibration_window():
 
 def test_motion_at_five_degrees_stays_in_calibration_window():
     boundary = identity_body()
-    boundary[4] = Rotation.from_euler("x", 5.0, degrees=True).as_quat()
+    boundary[4] = Rotation.from_euler("x", 10.0, degrees=True).as_quat()
     normalized = boundary.astype(np.float64)
     normalized /= np.linalg.norm(normalized, axis=1, keepdims=True)
     normalized = normalized.astype(np.float32)
-    boundary_angle = np.degrees(
-        2.0 * np.arccos(
-            np.clip(abs(np.sum(normalized[4] * normalized[0])), 0.0, 1.0)
+    expected_mean = Rotation.from_euler(
+        "x", 5.0, degrees=True
+    ).as_quat().astype(np.float32)
+    endpoint_dots = np.array(
+        [normalized[0] @ expected_mean, normalized[4] @ expected_mean]
+    )
+    boundary_angle = np.max(
+        np.degrees(
+            2.0 * np.arccos(np.clip(np.abs(endpoint_dots), 0.0, 1.0))
         )
     )
     calibrator = TPoseCalibrator(
@@ -111,18 +117,43 @@ def test_motion_at_five_degrees_stays_in_calibration_window():
     assert calibrator.frames_collected == 2
 
 
-def test_motion_is_compared_to_the_current_window_mean():
-    calibrator = TPoseCalibrator(required_frames=4, max_deviation_degrees=5.0)
+def test_motion_is_compared_to_every_frame_in_candidate_window():
+    calibrator = TPoseCalibrator(required_frames=5, max_deviation_degrees=5.0)
     calibrator.observe(identity_body())
     four_degrees = identity_body()
     four_degrees[4] = Rotation.from_euler("x", 4.0, degrees=True).as_quat()
     eight_degrees = identity_body()
     eight_degrees[4] = Rotation.from_euler("x", 8.0, degrees=True).as_quat()
+    ten_degrees = identity_body()
+    ten_degrees[4] = Rotation.from_euler("x", 10.0, degrees=True).as_quat()
 
     assert calibrator.observe(four_degrees) is False
     assert calibrator.frames_collected == 2
     assert calibrator.observe(eight_degrees) is False
+    assert calibrator.frames_collected == 3
+    assert calibrator.observe(ten_degrees) is False
     assert calibrator.frames_collected == 1
+
+
+def test_gradual_motion_cannot_chase_the_calibration_window_mean():
+    calibrator = TPoseCalibrator(
+        required_frames=5, max_deviation_degrees=5.0
+    )
+
+    for expected_count, angle in enumerate((0.0, 4.0, 6.0, 8.0), 1):
+        frame = identity_body()
+        frame[4] = Rotation.from_euler(
+            "x", angle, degrees=True
+        ).as_quat()
+        assert calibrator.observe(frame) is False
+        assert calibrator.frames_collected == expected_count
+
+    moved = identity_body()
+    moved[4] = Rotation.from_euler("x", 9.0, degrees=True).as_quat()
+
+    assert calibrator.observe(moved) is False
+    assert calibrator.frames_collected == 1
+    assert calibrator.is_calibrated is False
 
 
 def test_rest_alignment_uses_raw_times_inverse_rest():
