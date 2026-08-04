@@ -37,6 +37,13 @@ RKNN -> OpenVINO -> ONNX Runtime
 模型和 idle reference 分别来自 `assets/sonic.onnx` 和
 `assets/stream_reference.npz`。
 
+## ZeroLab F2 Pro
+
+本 Mod 也支持 ZeroLab F2 Pro 的固定 992 字节、50 Hz UDP 全身数据，可独立录制原始包，
+或通过 `sonic_zerolab` 状态向现有 SONIC 策略提供姿态。record-only 与实时状态都独占
+UDP 18000，不能同时运行。Windows/Ubuntu 配置、五项现场录制和 MuJoCo 验收步骤见
+[ZeroLab F2 Pro 现场接入与采集](ZEROLAB_F2_PRO.md)。
+
 ## 状态和事件
 
 - `com.bxi.sonic/sonic_teleop`：控制机器人本体的 29 个策略关节；是否控制夹爪由
