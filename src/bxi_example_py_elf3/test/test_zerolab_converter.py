@@ -6,10 +6,17 @@ from zerolab.converter import (
     BODY_JOINT_COUNT,
     SMPL24_PARENTS,
     TPoseCalibrator,
+    ZeroLabMotionConverter,
     align_quaternion_signs,
     apply_rest_alignment,
     synthesize_smpl_world_quats,
 )
+from zerolab.protocol import ZeroLabPacket
+from pico.gear_sonic.trl.utils.elf3_wrist import (
+    build_elf3_joint_pos,
+    compute_elf3_wrist_angles,
+)
+from pico.gear_sonic.trl.utils.numpy_smpl import compute_from_body_poses
 
 
 DIRECT_CASES = [
@@ -23,6 +30,28 @@ def identity_body():
     quats = np.zeros((BODY_JOINT_COUNT, 4), dtype=np.float32)
     quats[:, 3] = 1.0
     return quats
+
+
+def make_packet(index, quats47, root=None):
+    return ZeroLabPacket(
+        receive_timestamp_ns=index * 20_000_000,
+        local_frame_index=index,
+        root_translation=(
+            np.zeros(3, dtype=np.float32) if root is None else root
+        ),
+        joint_quat_world_xyzw=np.asarray(quats47, dtype=np.float32),
+        left_hand_values=np.zeros(6, dtype=np.uint16),
+        right_hand_values=np.zeros(6, dtype=np.uint16),
+        joint_position=np.zeros((17, 3), dtype=np.float32),
+        raw_payload=bytes(992),
+        sender_address=("127.0.0.1", 50000),
+    )
+
+
+def identity47():
+    result = np.zeros((47, 4), dtype=np.float32)
+    result[:, 3] = 1.0
+    return result
 
 
 def test_quaternion_sign_flip_is_continuous():
@@ -197,3 +226,194 @@ def test_all_converter_entry_points_reject_non_real_numeric_dtypes(
         TPoseCalibrator().observe(bad_quaternions)
     with pytest.raises(ValueError):
         synthesize_smpl_world_quats(bad_quaternions)
+
+
+def test_wrist_zero_and_axis_sign_conventions():
+    zero = build_elf3_joint_pos(
+        np.zeros((1, 21, 3), dtype=np.float32)
+    )[0]
+    np.testing.assert_array_equal(zero, np.zeros(29, dtype=np.float32))
+
+    pose = np.zeros((1, 21, 3), dtype=np.float32)
+    pose[0, 19, 0] = 0.2
+    pose[0, 20, 1] = 0.3
+    joints = build_elf3_joint_pos(pose)[0]
+    np.testing.assert_allclose(joints[[19, 27]], [0.2, -0.3], atol=1e-6)
+    np.testing.assert_array_equal(
+        np.delete(joints, [19, 20, 21, 26, 27, 28]),
+        np.zeros(23, dtype=np.float32),
+    )
+
+
+def test_wrist_matches_current_pico_golden_vector():
+    pose = np.zeros((1, 21, 3), dtype=np.float64)
+    pose[0, 17] = [0.20, -0.10, 0.30]
+    pose[0, 19] = [-0.15, 0.25, 0.05]
+    pose[0, 18] = [-0.30, 0.20, 0.10]
+    pose[0, 20] = [0.12, -0.22, 0.18]
+    expected = np.array([
+        0.052426428216, 0.245093826303, 0.357268492264,
+        0.166555238766, 0.207292703914, 0.263749028654,
+    ], dtype=np.float32)
+
+    actual = compute_elf3_wrist_angles(pose)
+
+    assert actual.dtype == np.float32
+    np.testing.assert_allclose(actual[0], expected, rtol=1e-6, atol=1e-7)
+    pico_joint_pos = build_elf3_joint_pos(pose, dtype=np.float64)
+    assert pico_joint_pos.dtype == np.float64
+
+
+def test_mirrored_wrist_inputs_have_symmetric_approved_right_side_signs():
+    pose = np.zeros((1, 21, 3), dtype=np.float64)
+    pose[0, [17, 18]] = [0.20, -0.10, 0.30]
+    pose[0, [19, 20]] = [-0.15, 0.25, 0.05]
+
+    wrists = compute_elf3_wrist_angles(pose, dtype=np.float64)[0]
+
+    assert np.isfinite(wrists).all()
+    np.testing.assert_allclose(np.abs(wrists[:3]), np.abs(wrists[3:]))
+    np.testing.assert_allclose(
+        wrists[3:], [-wrists[0], -wrists[1], wrists[2]]
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_pose",
+    [
+        np.zeros((21, 3), dtype=np.float32),
+        np.zeros((0, 21, 3), dtype=np.float32),
+        np.zeros((1, 20, 3), dtype=np.float32),
+        np.full((1, 21, 3), np.nan, dtype=np.float32),
+    ],
+)
+def test_wrist_helper_rejects_bad_shape_empty_batch_and_nonfinite(bad_pose):
+    with pytest.raises(ValueError):
+        compute_elf3_wrist_angles(bad_pose)
+    with pytest.raises(ValueError):
+        build_elf3_joint_pos(bad_pose)
+
+
+@pytest.mark.parametrize("bad_dtype", [np.float16, np.int64, object])
+def test_wrist_helper_restricts_output_dtype(bad_dtype):
+    pose = np.zeros((1, 21, 3), dtype=np.float32)
+    with pytest.raises(ValueError):
+        compute_elf3_wrist_angles(pose, dtype=bad_dtype)
+    with pytest.raises(ValueError):
+        build_elf3_joint_pos(pose, dtype=bad_dtype)
+
+
+def test_converter_uses_100_frames_only_for_rest_then_emits_frame_101():
+    converter = ZeroLabMotionConverter()
+    for index in range(100):
+        assert converter.observe(make_packet(index, identity47())) is None
+
+    output = converter.observe(make_packet(100, identity47()))
+
+    assert output.frame_index == 100
+    assert output.receive_timestamp_ns == 2_000_000_000
+    assert output.smpl_body_pose.shape == (21, 3)
+    assert output.smpl_joints.shape == (24, 3)
+    assert output.body_quat_w.shape == (4,)
+    assert output.joint_pos.shape == (29,)
+    assert output.smpl_body_pose.dtype == np.float32
+    assert output.smpl_joints.dtype == np.float32
+    assert output.body_quat_w.dtype == np.float32
+    assert output.joint_pos.dtype == np.float32
+    assert np.isfinite(output.smpl_joints).all()
+    np.testing.assert_allclose(output.smpl_body_pose, 0.0, atol=1e-6)
+
+
+def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
+    converter = ZeroLabMotionConverter()
+    rest = identity47()
+    for index in range(100):
+        converter.observe(make_packet(index, rest))
+    t_pose = converter.observe(make_packet(100, rest))
+
+    yaw = Rotation.from_euler("y", 30.0, degrees=True)
+    yawed = identity47()
+    yawed[:17] = (yaw * Rotation.from_quat(rest[:17])).as_quat()
+    output = converter.observe(make_packet(101, yawed))
+
+    virtual = synthesize_smpl_world_quats(
+        apply_rest_alignment(yawed[:17], rest[:17])
+    )
+    body_poses = np.zeros((24, 7), dtype=np.float32)
+    body_poses[:, 3:] = virtual
+    expected = compute_from_body_poses(SMPL24_PARENTS, body_poses)
+    np.testing.assert_allclose(
+        output.smpl_joints, expected["smpl_joints_local"][0], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        output.smpl_joints - output.smpl_joints[0],
+        t_pose.smpl_joints - t_pose.smpl_joints[0],
+        atol=1e-6,
+    )
+    assert not np.allclose(output.body_quat_w, t_pose.body_quat_w)
+
+
+def test_left_elbow_motion_changes_only_left_wrist_chain():
+    converter = ZeroLabMotionConverter()
+    rest = identity47()
+    for index in range(100):
+        converter.observe(make_packet(index, rest))
+    t_pose = converter.observe(make_packet(100, rest))
+
+    moved = identity47()
+    left_rotation = Rotation.from_euler("z", 30.0, degrees=True).as_quat()
+    moved[[4, 5]] = left_rotation
+    output = converter.observe(make_packet(101, moved))
+
+    assert not np.allclose(output.smpl_joints[20], t_pose.smpl_joints[20])
+    assert not np.allclose(output.smpl_joints[22], t_pose.smpl_joints[22])
+    np.testing.assert_allclose(
+        output.smpl_joints[0], t_pose.smpl_joints[0], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        output.smpl_joints[[17, 19, 21, 23]],
+        t_pose.smpl_joints[[17, 19, 21, 23]],
+        atol=1e-6,
+    )
+
+
+def test_converter_checks_47_quaternions_but_ignores_last_30():
+    converter = ZeroLabMotionConverter()
+    rest = identity47()
+    for index in range(100):
+        converter.observe(make_packet(index, rest))
+    baseline = converter.observe(make_packet(100, rest))
+
+    unused_changed = identity47()
+    unused_changed[17:] = Rotation.random(30, random_state=123).as_quat()
+    output = converter.observe(make_packet(101, unused_changed))
+    np.testing.assert_array_equal(
+        output.smpl_body_pose, baseline.smpl_body_pose
+    )
+    np.testing.assert_array_equal(output.smpl_joints, baseline.smpl_joints)
+    np.testing.assert_array_equal(output.body_quat_w, baseline.body_quat_w)
+    np.testing.assert_array_equal(output.joint_pos, baseline.joint_pos)
+
+    invalid_unused = identity47()
+    invalid_unused[-1] = 0.0
+    with pytest.raises(ValueError):
+        converter.observe(make_packet(102, invalid_unused))
+
+
+def test_stale_and_reset_session_have_distinct_calibration_semantics():
+    converter = ZeroLabMotionConverter()
+    rest = identity47()
+    for index in range(99):
+        assert converter.observe(make_packet(index, rest)) is None
+    converter.mark_stale()
+    for index in range(99, 199):
+        assert converter.observe(make_packet(index, rest)) is None
+    assert converter.observe(make_packet(199, rest)) is not None
+
+    converter.mark_stale()
+    assert converter.observe(make_packet(200, rest)) is not None
+
+    converter.reset_session()
+    for index in range(201, 301):
+        assert converter.observe(make_packet(index, rest)) is None
+    assert converter.observe(make_packet(301, rest)) is not None

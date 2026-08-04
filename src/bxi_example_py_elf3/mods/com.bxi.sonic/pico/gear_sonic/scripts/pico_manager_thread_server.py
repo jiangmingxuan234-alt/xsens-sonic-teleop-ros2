@@ -19,6 +19,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as sRot
 import zmq
 
+from gear_sonic.trl.utils.elf3_wrist import build_elf3_joint_pos
 from gear_sonic.trl.utils.numpy_smpl import compute_from_body_poses
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from service_runtime import resolve_service_root, service_library_paths
@@ -771,33 +772,6 @@ def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.nd
     return q
 
 
-def _decompose_rotation_axis_angle(
-    rotation_axis_angle: np.ndarray, twist_axis: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Split rotations into twist and swing quaternions in wxyz order."""
-    rotations = np.asarray(rotation_axis_angle, dtype=np.float64)
-    axis = np.asarray(twist_axis, dtype=np.float64)
-    axis /= np.linalg.norm(axis)
-    quaternions = sRot.from_rotvec(rotations).as_quat(scalar_first=True)
-    twist = np.concatenate(
-        (
-            quaternions[:, :1],
-            (quaternions[:, 1:] @ axis)[:, None] * axis,
-        ),
-        axis=1,
-    )
-    norms = np.linalg.norm(twist, axis=1, keepdims=True)
-    degenerate = norms[:, 0] < 1e-12
-    twist[~degenerate] /= norms[~degenerate]
-    twist[degenerate] = np.array([1.0, 0.0, 0.0, 0.0])
-    twist_inverse = twist * np.array([1.0, -1.0, -1.0, -1.0])
-    swing = (
-        sRot.from_quat(twist_inverse, scalar_first=True)
-        * sRot.from_quat(quaternions, scalar_first=True)
-    ).as_quat(scalar_first=True)
-    return twist, swing
-
-
 def _interp_pose_axis_angle(
     prev_pose: np.ndarray, curr_pose: np.ndarray, alpha: float
 ) -> np.ndarray:
@@ -1445,61 +1419,11 @@ class PoseStreamer:
         N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
-        joint_pos = np.zeros(29)
-        body_pose = use_pose.reshape(-1, 21, 3)
-
-        SMPL_L_ELBOW_IDX = 17
-        SMPL_L_WRIST_IDX = 19
-        SMPL_R_ELBOW_IDX = 18
-        SMPL_R_WRIST_IDX = 20
-
-        ELF3_L_WRIST_X_IDX = 19
-        ELF3_L_WRIST_Y_IDX = 20
-        ELF3_L_WRIST_Z_IDX = 21
-        ELF3_R_WRIST_X_IDX = 26
-        ELF3_R_WRIST_Y_IDX = 27
-        ELF3_R_WRIST_Z_IDX = 28
-        smpl_l_elbow_aa = body_pose[:, SMPL_L_ELBOW_IDX]
-        smpl_l_wrist_aa = body_pose[:, SMPL_L_WRIST_IDX]
-        smpl_r_elbow_aa = body_pose[:, SMPL_R_ELBOW_IDX]
-        smpl_r_wrist_aa = body_pose[:, SMPL_R_WRIST_IDX]
-
-        elf3_l_elbow_axis = np.array([0, 1, 0])
-        _elf3_l_elbow_q_twist, elf3_l_elbow_q_swing = _decompose_rotation_axis_angle(
-            smpl_l_elbow_aa, elf3_l_elbow_axis
-        )
-
-        elf3_r_elbow_axis = np.array([0, 1, 0])
-        _elf3_r_elbow_q_twist, elf3_r_elbow_q_swing = _decompose_rotation_axis_angle(
-            smpl_r_elbow_aa, elf3_r_elbow_axis
-        )
-
-        # Move elbow roll/yaw into wrist while preserving wrist pitch from SMPL
-        l_elbow_swing_euler = sRot.from_quat(
-            elf3_l_elbow_q_swing[:, [1, 2, 3, 0]]
-        ).as_euler("XYZ", degrees=False)
-        r_elbow_swing_euler = sRot.from_quat(
-            elf3_r_elbow_q_swing[:, [1, 2, 3, 0]]
-        ).as_euler("XYZ", degrees=False)
-
-        l_wrist_euler = sRot.from_rotvec(smpl_l_wrist_aa).as_euler("XYZ", degrees=False)
-        r_wrist_euler = sRot.from_rotvec(smpl_r_wrist_aa).as_euler("XYZ", degrees=False)
-
-        elf3_l_wrist_x = l_elbow_swing_euler[:, 0] + l_wrist_euler[:, 0]
-        elf3_l_wrist_y = l_wrist_euler[:, 1]
-        elf3_l_wrist_z = l_elbow_swing_euler[:, 2] + l_wrist_euler[:, 2]
-
-        elf3_r_wrist_x = -(r_elbow_swing_euler[:, 0] + r_wrist_euler[:, 0])
-        elf3_r_wrist_y = -r_wrist_euler[:, 1]
-        elf3_r_wrist_z = r_elbow_swing_euler[:, 2] + r_wrist_euler[:, 2]
-
-        joint_pos[ELF3_L_WRIST_X_IDX] = elf3_l_wrist_x[0]
-        joint_pos[ELF3_L_WRIST_Y_IDX] = elf3_l_wrist_y[0]
-        joint_pos[ELF3_L_WRIST_Z_IDX] = elf3_l_wrist_z[0]
-
-        joint_pos[ELF3_R_WRIST_X_IDX] = elf3_r_wrist_x[0]
-        joint_pos[ELF3_R_WRIST_Y_IDX] = elf3_r_wrist_y[0]
-        joint_pos[ELF3_R_WRIST_Z_IDX] = elf3_r_wrist_z[0]
+        # Keep the existing PICO packed-message dtype and precision unchanged.
+        joint_pos = build_elf3_joint_pos(
+            use_pose.reshape(1, 21, 3),
+            dtype=np.float64,
+        )[0]
 
         # Process SMPL pose to get calibrated 3-point VR pose and update visualization
         # Pass SMPL local joints for optional body visualization in the VR3Pt viewer

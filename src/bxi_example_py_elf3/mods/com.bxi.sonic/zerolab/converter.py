@@ -1,7 +1,19 @@
-"""Quaternion calibration and ZeroLab-to-SMPL world-rotation mapping."""
+"""Quaternion calibration and ZeroLab-to-SONIC pose conversion."""
+
+from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation, Slerp
+
+from .protocol import ZeroLabPacket
+
+if __package__ == "zerolab":
+    from pico.gear_sonic.trl.utils.elf3_wrist import build_elf3_joint_pos
+    from pico.gear_sonic.trl.utils.numpy_smpl import compute_from_body_poses
+else:
+    from ..pico.gear_sonic.trl.utils.elf3_wrist import build_elf3_joint_pos
+    from ..pico.gear_sonic.trl.utils.numpy_smpl import compute_from_body_poses
 
 
 BODY_JOINT_COUNT = 17
@@ -11,6 +23,19 @@ SMPL24_PARENTS = [
 ]
 
 _BODY_QUATERNION_SHAPE = (BODY_JOINT_COUNT, 4)
+_PACKET_QUATERNION_SHAPE = (47, 4)
+
+
+@dataclass(frozen=True)
+class ConvertedPoseFrame:
+    """One ZeroLab frame converted to the arrays expected by SONIC."""
+
+    frame_index: int
+    receive_timestamp_ns: int
+    smpl_body_pose: NDArray[np.float32]
+    smpl_joints: NDArray[np.float32]
+    body_quat_w: NDArray[np.float32]
+    joint_pos: NDArray[np.float32]
 
 
 def _normalize_quaternions(quats, expected_shape):
@@ -169,3 +194,106 @@ def synthesize_smpl_world_quats(aligned_body_xyzw):
     smpl[22] = smpl[20]
     smpl[23] = smpl[21]
     return smpl
+
+
+def _validated_root_translation(root_translation):
+    source = np.asarray(root_translation)
+    if not np.issubdtype(source.dtype, np.number) or np.issubdtype(
+        source.dtype, np.complexfloating
+    ):
+        raise ValueError("root translation must use a real numeric dtype")
+    values = source.astype(np.float64, copy=False)
+    if values.shape != (3,) or not np.isfinite(values).all():
+        raise ValueError("root translation must be finite with shape (3,)")
+    return np.ascontiguousarray(values, dtype=np.float32)
+
+
+def _validated_converted_array(
+    name, values, expected_shape, *, quaternion=False
+):
+    array = np.asarray(values)
+    if array.shape != expected_shape or not np.isfinite(array).all():
+        raise ValueError(
+            f"derived {name} must be finite with shape {expected_shape}"
+        )
+    result = np.ascontiguousarray(array, dtype=np.float32)
+    if quaternion:
+        norm = float(np.linalg.norm(result.astype(np.float64)))
+        if not np.isfinite(norm) or not np.isclose(norm, 1.0, atol=1e-5):
+            raise ValueError(f"derived {name} must be a unit quaternion")
+    return result
+
+
+class ZeroLabMotionConverter:
+    """Calibrate ZeroLab rest quaternions and emit SONIC pose frames."""
+
+    def __init__(self) -> None:
+        self._calibrator = TPoseCalibrator()
+        self._previous_raw_quats_xyzw = None
+
+    def mark_stale(self) -> None:
+        """Clear continuity and any incomplete rest-calibration window."""
+        self._previous_raw_quats_xyzw = None
+        if not self._calibrator.is_calibrated:
+            self._calibrator.reset()
+
+    def reset_session(self) -> None:
+        """Clear quaternion continuity and all session calibration."""
+        self._previous_raw_quats_xyzw = None
+        self._calibrator.reset()
+
+    def observe(self, packet: ZeroLabPacket) -> ConvertedPoseFrame | None:
+        """Observe a packet and return a frame after rest calibration."""
+        raw_quats = _normalize_quaternions(
+            packet.joint_quat_world_xyzw, _PACKET_QUATERNION_SHAPE
+        )
+        raw_quats = align_quaternion_signs(
+            raw_quats, self._previous_raw_quats_xyzw
+        )
+
+        if not self._calibrator.is_calibrated:
+            self._calibrator.observe(raw_quats[:BODY_JOINT_COUNT])
+            self._previous_raw_quats_xyzw = raw_quats
+            return None
+
+        aligned_body = apply_rest_alignment(
+            raw_quats[:BODY_JOINT_COUNT],
+            self._calibrator.rest_quats_xyzw,
+        )
+        smpl_world_quats = synthesize_smpl_world_quats(aligned_body)
+        body_poses = np.zeros((24, 7), dtype=np.float32)
+        body_poses[:, 3:] = smpl_world_quats
+        body_poses[0, :3] = _validated_root_translation(
+            packet.root_translation
+        )
+
+        result = compute_from_body_poses(SMPL24_PARENTS, body_poses)
+        smpl_body_pose = _validated_converted_array(
+            "smpl_body_pose",
+            result["smpl_pose"][0, :63].reshape(21, 3),
+            (21, 3),
+        )
+        smpl_joints = _validated_converted_array(
+            "smpl_joints", result["smpl_joints_local"][0], (24, 3)
+        )
+        body_quat_w = _validated_converted_array(
+            "body_quat_w",
+            result["global_orient_quat"][0],
+            (4,),
+            quaternion=True,
+        )
+        joint_pos = _validated_converted_array(
+            "joint_pos",
+            build_elf3_joint_pos(smpl_body_pose[None, ...])[0],
+            (29,),
+        )
+
+        self._previous_raw_quats_xyzw = raw_quats
+        return ConvertedPoseFrame(
+            frame_index=int(packet.local_frame_index),
+            receive_timestamp_ns=int(packet.receive_timestamp_ns),
+            smpl_body_pose=smpl_body_pose,
+            smpl_joints=smpl_joints,
+            body_quat_w=body_quat_w,
+            joint_pos=joint_pos,
+        )
