@@ -1,5 +1,6 @@
 from pathlib import Path
 import socket
+import time
 
 import numpy as np
 import pytest
@@ -7,6 +8,14 @@ import rclpy
 import zmq
 
 from bxi_example_py_elf3.framework.mod_api import NodeBuildContext
+from bxi_example_py_elf3.framework.runtime.logging import (
+    LoggingConfig,
+    ScopedLoggers,
+)
+from bxi_example_py_elf3.framework.runtime.mod_nodes import (
+    ModNodeManager,
+    ModNodeSpec,
+)
 from pico.pose_to_smpl_ref_bridge import SmplRefBridgeNode
 from zerolab.converter import ZeroLabMotionConverter
 from zerolab.source_node import (
@@ -15,6 +24,9 @@ from zerolab.source_node import (
     validate_source_params,
 )
 from zerolab.udp_receiver import ReceivedDatagram
+
+
+MOD_ROOT = Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
 
 
 def free_port(sock_type):
@@ -314,3 +326,147 @@ def test_executor_gap_backlog_logs_stale_before_same_tick_ready(monkeypatch):
     ready_event = logger.events.index(("info", ready_message))
     assert stale_event < ready_event
     assert node._stream_state == "ready"
+
+
+class NullLogger:
+    def get_child(self, _name):
+        return self
+
+    def set_level(self, _level):
+        pass
+
+    def debug(self, _message):
+        pass
+
+    def info(self, _message):
+        pass
+
+    def warning(self, _message):
+        pass
+
+    def error(self, _message):
+        pass
+
+    def fatal(self, _message):
+        pass
+
+
+class FakeExecutor:
+    def add_node(self, _node):
+        return True
+
+    def remove_node(self, _node):
+        return True
+
+
+class BindingNode:
+    def __init__(self, endpoint):
+        self.destroy_count = 0
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PUB)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.bind(endpoint)
+
+    def destroy_node(self):
+        self.destroy_count += 1
+        self.socket.close(linger=0)
+        self.context.term()
+
+
+def make_binding_spec(local_name, state_name, factory):
+    return ModNodeSpec(
+        id=f"com.bxi.sonic/{local_name}",
+        mod_id="com.bxi.sonic",
+        local_name=local_name,
+        node_name=local_name,
+        mod_root=MOD_ROOT,
+        manifest_path=MOD_ROOT / "mod.yaml",
+        entrypoint="test:factory",
+        execution="in_process",
+        lifecycle="state",
+        states=(state_name,),
+        params={},
+        manifest={},
+        restart_max_attempts=0,
+        restart_delay=0.0,
+        factory=factory,
+    )
+
+
+def wait_until_real_zmq_bind_succeeds(manager, endpoint, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        manager.poll()
+        context = zmq.Context()
+        probe = context.socket(zmq.PUB)
+        probe.setsockopt(zmq.LINGER, 0)
+        try:
+            probe.bind(endpoint)
+            return
+        except zmq.ZMQError as exc:
+            if exc.errno != zmq.EADDRINUSE:
+                raise
+        finally:
+            probe.close(linger=0)
+            context.term()
+        time.sleep(0.02)
+    raise AssertionError(
+        f"endpoint was not released within {timeout_s}s: {endpoint}"
+    )
+
+
+def test_manager_poll_releases_shared_bridge_port_after_each_state_stops():
+    endpoint = f"tcp://127.0.0.1:{free_port(socket.SOCK_STREAM)}"
+    instances = []
+
+    def pico_factory(_context):
+        instance = BindingNode(endpoint)
+        instances.append(instance)
+        return instance
+
+    def zero_factory(_context):
+        instance = BindingNode(endpoint)
+        instances.append(instance)
+        return instance
+
+    root_logger = NullLogger()
+    loggers = ScopedLoggers(
+        root_logger,
+        LoggingConfig(),
+        logger_factory=lambda _name: root_logger,
+    )
+    manager = ModNodeManager(
+        (
+            make_binding_spec(
+                "pico_test_bridge", "com.bxi.sonic/sonic_teleop", pico_factory
+            ),
+            make_binding_spec(
+                "zero_test_bridge", "com.bxi.sonic/sonic_zerolab", zero_factory
+            ),
+        ),
+        loggers=loggers,
+    )
+    fake_executor = FakeExecutor()
+    try:
+        manager.start()
+        manager.attach_executor(fake_executor)
+        manager.activate_initial_state("com.bxi.basic_actions/normal")
+
+        manager.prepare_state("com.bxi.sonic/sonic_teleop")
+        manager.finish_transition(
+            "com.bxi.basic_actions/normal", "com.bxi.sonic/sonic_teleop"
+        )
+        manager.prepare_state("com.bxi.basic_actions/normal")
+        manager.finish_transition(
+            "com.bxi.sonic/sonic_teleop", "com.bxi.basic_actions/normal"
+        )
+        wait_until_real_zmq_bind_succeeds(manager, endpoint, timeout_s=2.0)
+
+        manager.prepare_state("com.bxi.sonic/sonic_zerolab")
+        manager.cancel_prepared_state("com.bxi.sonic/sonic_zerolab")
+        wait_until_real_zmq_bind_succeeds(manager, endpoint, timeout_s=2.0)
+    finally:
+        manager.close()
+
+    assert len(instances) == 2
+    assert all(instance.destroy_count == 1 for instance in instances)

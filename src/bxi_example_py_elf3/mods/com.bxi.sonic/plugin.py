@@ -7,7 +7,7 @@ from bxi_example_py_elf3.framework.mod_api import (
 )
 
 from .policy import SonicTeleopPolicy
-from .state import SonicTeleopState
+from .state import PICO_OPERATOR_PROMPT, SonicTeleopState
 
 
 SONIC_POLICY = ResourceKey[SonicTeleopPolicy]("com.bxi.sonic/policy")
@@ -28,6 +28,9 @@ def _build_state(
         state.name,
         state.state_id,
         policy,
+        operator_prompt=state.string_param(
+            "operator_prompt", PICO_OPERATOR_PROMPT
+        ),
         require_live_reference=state.bool_param(
             "require_live_reference",
             False,
@@ -59,6 +62,7 @@ def create_mod(context: ModLoadContext) -> ModDefinition:
     return ModDefinition(
         state_factories={
             "sonic_teleop": lambda state: _build_state(state, policy),
+            "sonic_zerolab": lambda state: _build_state(state, policy),
         }
     )
 

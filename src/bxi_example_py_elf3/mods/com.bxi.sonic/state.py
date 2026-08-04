@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     from bxi_example_py_elf3.framework.mod_api import LoggerLike, RobotControlContext
 
 
+PICO_OPERATOR_PROMPT = (
+    "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
+)
+
+
 class SonicPolicy(Protocol):
     output: PolicyOutput
     last_status: str
@@ -73,6 +78,7 @@ class SonicTeleopState(
         state_id: int,
         policy: ResourceHandle[SonicPolicy],
         *,
+        operator_prompt: str = PICO_OPERATOR_PROMPT,
         require_live_reference: bool = False,
         yaw_bias_rad: float = math.pi / 2.0,
         live_reference_timeout_s: float = 0.5,
@@ -88,6 +94,9 @@ class SonicTeleopState(
         gripper_kd: float = 1.0,
     ) -> None:
         super().__init__(name, state_id, resources=(policy,))
+        if not isinstance(operator_prompt, str) or not operator_prompt.strip():
+            raise ValueError("operator_prompt must be a non-empty string")
+        self.operator_prompt = operator_prompt
         if gripper_input_timeout_s <= 0.0:
             raise ValueError("gripper_input_timeout_s must be positive")
         self._policy = policy
@@ -232,9 +241,7 @@ class SonicTeleopState(
 
     def on_enter(self, ctx: RobotControlContext) -> None:
         mode = "SONIC遥操（夹爪）" if self.hardware_gripper else "SONIC遥操"
-        self.logger.info(
-            f"{mode}已启动；PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
-        )
+        self.logger.info(f"{mode}已启动；{self.operator_prompt}")
 
     def on_exit(self, ctx: RobotControlContext) -> None:
         self._gripper_session_active = False
