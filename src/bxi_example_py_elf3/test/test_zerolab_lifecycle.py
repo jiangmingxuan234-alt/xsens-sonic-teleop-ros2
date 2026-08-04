@@ -1,13 +1,20 @@
 from pathlib import Path
 import socket
 
+import numpy as np
 import pytest
 import rclpy
 import zmq
 
 from bxi_example_py_elf3.framework.mod_api import NodeBuildContext
 from pico.pose_to_smpl_ref_bridge import SmplRefBridgeNode
-from zerolab.source_node import ZeroLabSourceNode, validate_source_params
+from zerolab.converter import ZeroLabMotionConverter
+from zerolab.source_node import (
+    ZeroLabSourceCore,
+    ZeroLabSourceNode,
+    validate_source_params,
+)
+from zerolab.udp_receiver import ReceivedDatagram
 
 
 def free_port(sock_type):
@@ -143,3 +150,167 @@ def test_existing_bridge_releases_its_output_port(rclpy_runtime):
         NodeBuildContext("com.bxi.sonic", "bridge_b", "bridge_b", root, params)
     )
     second.destroy_node()
+
+
+class ControlledReceiver:
+    def __init__(self, payload):
+        self.payload = payload
+        self.pending = []
+
+    def queue(self, frame_index, timestamp_ns):
+        self.pending.append(
+            ReceivedDatagram(
+                payload=self.payload,
+                receive_timestamp_ns=timestamp_ns,
+                local_frame_index=frame_index,
+                sender_address=("127.0.0.1", 50000),
+            )
+        )
+
+    def drain(self):
+        pending, self.pending = self.pending, []
+        return pending
+
+
+class CapturingPublisher:
+    def __init__(self):
+        self.frame_indices = []
+        self.frame_windows = []
+
+    def send(self, fields):
+        self.frame_indices.append(int(fields["frame_index"][-1]))
+        self.frame_windows.append(np.asarray(fields["frame_index"]).copy())
+
+
+class CapturingLogger:
+    def __init__(self):
+        self.infos = []
+        self.warnings = []
+        self.events = []
+
+    def info(self, message):
+        self.infos.append(message)
+        self.events.append(("info", message))
+
+    def warning(self, message):
+        self.warnings.append(message)
+        self.events.append(("warning", message))
+
+
+def identity_payload():
+    root = np.zeros(3, dtype="<f4")
+    quaternions = np.zeros((47, 4), dtype="<f4")
+    quaternions[:, 3] = 1.0
+    hands = np.zeros(6, dtype="<u2")
+    positions = np.zeros((17, 3), dtype="<f4")
+    return b"".join(
+        (
+            root.tobytes(),
+            quaternions.tobytes(),
+            hands.tobytes(),
+            hands.tobytes(),
+            positions.tobytes(),
+        )
+    )
+
+
+def test_executor_gap_logs_stale_once_then_ready_once_after_refill(
+    monkeypatch,
+):
+    clock_ns = [0]
+    monkeypatch.setattr(
+        "zerolab.source_node.time.monotonic_ns", lambda: clock_ns[0]
+    )
+    receiver = ControlledReceiver(identity_payload())
+    publisher = CapturingPublisher()
+    logger = CapturingLogger()
+    node = ZeroLabSourceNode.__new__(ZeroLabSourceNode)
+    node._closed = False
+    node._receiver = receiver
+    node._converter = ZeroLabMotionConverter()
+    node._core = ZeroLabSourceCore(node._converter)
+    node._publisher = publisher
+    node._writer = None
+    node._recording_enabled = False
+    node._invalid_packets = 0
+    node._dropped_publications = 0
+    node._stream_state = None
+    node.get_logger = lambda: logger
+
+    for frame_index in range(110):
+        clock_ns[0] = frame_index * 20_000_000
+        receiver.queue(frame_index, clock_ns[0])
+        node._tick()
+
+    assert publisher.frame_indices == [109]
+    assert logger.infos.count("ZeroLab stream ready; frame=109") == 1
+
+    clock_ns[0] += 500_000_001
+    receiver.queue(110, clock_ns[0])
+    node._tick()
+    node._tick()
+
+    stale_message = "ZeroLab input stale; live pose publication stopped"
+    assert logger.warnings.count(stale_message) == 1
+
+    gap_timestamp_ns = clock_ns[0]
+    for frame_index in range(111, 120):
+        clock_ns[0] = gap_timestamp_ns + (frame_index - 110) * 20_000_000
+        receiver.queue(frame_index, clock_ns[0])
+        node._tick()
+    node._tick()
+
+    assert publisher.frame_indices == [109, 119]
+    assert logger.warnings.count(stale_message) == 1
+    assert logger.infos.count("ZeroLab stream ready; frame=119") == 1
+    assert logger.infos.count("ZeroLab collecting T-pose calibration") == 2
+
+
+def test_executor_gap_backlog_logs_stale_before_same_tick_ready(monkeypatch):
+    clock_ns = [0]
+    monkeypatch.setattr(
+        "zerolab.source_node.time.monotonic_ns", lambda: clock_ns[0]
+    )
+    receiver = ControlledReceiver(identity_payload())
+    publisher = CapturingPublisher()
+    logger = CapturingLogger()
+    node = ZeroLabSourceNode.__new__(ZeroLabSourceNode)
+    node._closed = False
+    node._receiver = receiver
+    node._converter = ZeroLabMotionConverter()
+    node._core = ZeroLabSourceCore(node._converter)
+    node._publisher = publisher
+    node._writer = None
+    node._recording_enabled = False
+    node._invalid_packets = 0
+    node._dropped_publications = 0
+    node._stream_state = None
+    node.get_logger = lambda: logger
+
+    for frame_index in range(110):
+        clock_ns[0] = frame_index * 20_000_000
+        receiver.queue(frame_index, clock_ns[0])
+        node._tick()
+
+    pre_gap_timestamp_ns = clock_ns[0] + 20_000_000
+    receiver.queue(110, pre_gap_timestamp_ns)
+    gap_timestamp_ns = pre_gap_timestamp_ns + 500_000_001
+    for frame_index in range(111, 121):
+        timestamp_ns = gap_timestamp_ns + (frame_index - 111) * 20_000_000
+        receiver.queue(frame_index, timestamp_ns)
+        clock_ns[0] = timestamp_ns
+    node._tick()
+    node._tick()
+
+    stale_message = "ZeroLab input stale; live pose publication stopped"
+    assert publisher.frame_indices == [109, 120]
+    np.testing.assert_array_equal(
+        publisher.frame_windows[-1], np.arange(111, 121)
+    )
+    assert logger.warnings.count(stale_message) == 1
+    ready_message = "ZeroLab stream ready; frame=120"
+    assert logger.infos.count(ready_message) == 1
+    stale_event = logger.events.index(("warning", stale_message))
+    ready_event = logger.events.index(("info", ready_message))
+    assert stale_event < ready_event
+    assert node._stream_state == "ready"

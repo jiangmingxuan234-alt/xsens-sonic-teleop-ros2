@@ -207,11 +207,19 @@ class ZeroLabSourceCore:
         self._stale_ns = int(float(stale_seconds) * 1_000_000_000)
         self._last_timestamp_ns = None
         self._stale_handled = False
+        self._stale_event_pending = False
 
     def _mark_stale(self) -> None:
         self._window.clear()
         self._converter.mark_stale()
         self._stale_handled = True
+        self._stale_event_pending = True
+
+    def consume_stale_event(self) -> bool:
+        """Return and clear a pending stale transition."""
+        pending = self._stale_event_pending
+        self._stale_event_pending = False
+        return pending
 
     def accept(self, packet):
         timestamp_ns = operator.index(packet.receive_timestamp_ns)
@@ -421,6 +429,7 @@ class ZeroLabSourceNode(Node):
             return
         latest_fields = None
         received_valid = False
+        became_stale = False
         for datagram in self._receiver.drain():
             try:
                 packet = parse_zerolab_packet(
@@ -438,24 +447,34 @@ class ZeroLabSourceNode(Node):
             received_valid = True
             self._record_valid_packet_if_enabled(packet)
             fields = self._core.accept(packet)
+            if self._core.consume_stale_event():
+                became_stale = True
+                latest_fields = None
             if fields is not None:
                 latest_fields = fields
 
-        became_stale = self._core.check_stale(time.monotonic_ns())
+        self._core.check_stale(time.monotonic_ns())
+        if self._core.consume_stale_event():
+            became_stale = True
+            latest_fields = None
+        if became_stale:
+            self._set_stream_state("stale")
         if latest_fields is not None:
             try:
                 self._publisher.send(latest_fields)
             except zmq.Again:
                 self._dropped_publications += 1
 
-        if became_stale:
-            self._set_stream_state("stale")
-        elif latest_fields is not None:
+        if latest_fields is not None:
             self._set_stream_state(
                 "ready", frame_index=int(latest_fields["frame_index"][-1])
             )
-        elif self._stream_state is None or (
-            received_valid and self._stream_state == "stale"
+        elif (
+            not became_stale
+            and (
+                self._stream_state is None
+                or (received_valid and self._stream_state == "stale")
+            )
         ):
             self._set_stream_state("collecting")
 
