@@ -10,6 +10,7 @@ from zerolab.converter import (
     align_quaternion_signs,
     apply_rest_alignment,
     synthesize_smpl_world_quats,
+    unity_world_quaternions_to_xrt,
 )
 from zerolab.protocol import ZeroLabPacket
 from pico.gear_sonic.trl.utils.elf3_wrist import (
@@ -391,13 +392,18 @@ def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
         converter.observe(make_packet(index, rest))
     t_pose = converter.observe(make_packet(100, rest))
 
-    yaw = Rotation.from_euler("y", 30.0, degrees=True)
-    yawed = identity47()
-    yawed[:17] = (yaw * Rotation.from_quat(rest[:17])).as_quat()
-    output = converter.observe(make_packet(101, yawed))
+    unity_yaw = Rotation.from_euler("y", 30.0, degrees=True)
+    unity_yawed = identity47()
+    unity_yawed[:17] = (
+        unity_yaw * Rotation.from_quat(rest[:17])
+    ).as_quat()
+    output = converter.observe(make_packet(101, unity_yawed))
 
+    xrt_yawed = unity_world_quaternions_to_xrt(
+        unity_yawed, (47, 4)
+    )
     virtual = synthesize_smpl_world_quats(
-        apply_rest_alignment(yawed[:17], rest[:17])
+        apply_rest_alignment(xrt_yawed[:17], rest[:17])
     )
     body_poses = np.zeros((24, 7), dtype=np.float32)
     body_poses[:, 3:] = virtual

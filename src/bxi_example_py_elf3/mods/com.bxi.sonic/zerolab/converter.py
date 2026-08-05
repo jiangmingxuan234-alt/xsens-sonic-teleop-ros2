@@ -56,6 +56,13 @@ def _normalize_quaternions(quats, expected_shape):
     return np.ascontiguousarray(values / norms, dtype=np.float32)
 
 
+def unity_world_quaternions_to_xrt(quats_xyzw, expected_shape):
+    """Reflect Unity world quaternions into the XRT coordinate system."""
+    converted = _normalize_quaternions(quats_xyzw, expected_shape)
+    converted[:, :2] *= -1.0
+    return np.ascontiguousarray(converted, dtype=np.float32)
+
+
 def align_quaternion_signs(current_xyzw, previous_xyzw=None):
     """Choose quaternion representatives closest to a previous frame."""
     current_values = np.asarray(current_xyzw)
@@ -239,7 +246,7 @@ class ZeroLabMotionConverter:
 
     def observe(self, packet: ZeroLabPacket) -> ConvertedPoseFrame | None:
         """Observe a packet and return a frame after rest calibration."""
-        raw_quats = _normalize_quaternions(
+        raw_quats = unity_world_quaternions_to_xrt(
             packet.joint_quat_world_xyzw, _PACKET_QUATERNION_SHAPE
         )
         raw_quats = align_quaternion_signs(
@@ -258,9 +265,9 @@ class ZeroLabMotionConverter:
         smpl_world_quats = synthesize_smpl_world_quats(aligned_body)
         body_poses = np.zeros((24, 7), dtype=np.float32)
         body_poses[:, 3:] = smpl_world_quats
-        body_poses[0, :3] = _validated_root_translation(
-            packet.root_translation
-        )
+        root_translation = _validated_root_translation(packet.root_translation)
+        root_translation[2] *= -1.0
+        body_poses[0, :3] = root_translation
 
         result = compute_from_body_poses(SMPL24_PARENTS, body_poses)
         smpl_body_pose = _validated_converted_array(
