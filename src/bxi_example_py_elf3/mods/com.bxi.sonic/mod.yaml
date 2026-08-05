@@ -183,7 +183,7 @@ states:
       live_reference_timeout_s: 0.5
       idle_frame_start: 3509
       source_blend_seconds: 0.4
-      hardware_gripper: true
+      hardware_gripper: false
       gripper_input_timeout_s: 0.2
       gripper_release_threshold: 0.05
       gripper_left_bus: 5

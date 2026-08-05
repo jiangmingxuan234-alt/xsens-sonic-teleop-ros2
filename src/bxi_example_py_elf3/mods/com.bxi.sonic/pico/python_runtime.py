@@ -98,7 +98,7 @@ def _resolve_python(value: str) -> Path | None:
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     try:
-        candidate = candidate.resolve()
+        candidate = candidate.absolute()
     except OSError:
         return None
     return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
@@ -299,7 +299,7 @@ def select_python(
 
 def reexec_if_needed(component: str, imports: Sequence[str]) -> None:
     try:
-        current = Path(sys.executable).resolve()
+        current = Path(sys.executable).absolute()
     except OSError:
         current = Path(sys.executable)
     previously_selected = _resolve_python(os.environ.get(_SELECTED_PYTHON_ENV, ""))
