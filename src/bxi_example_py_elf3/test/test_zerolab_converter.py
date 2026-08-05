@@ -355,6 +355,35 @@ def test_converter_uses_100_frames_only_for_rest_then_emits_frame_101():
     np.testing.assert_allclose(output.smpl_body_pose, 0.0, atol=1e-6)
 
 
+def test_unity_yaw_direction_maps_physical_left_to_positive_sonic_yaw():
+    converter = ZeroLabMotionConverter()
+    rest = identity47()
+    for index in range(100):
+        assert converter.observe(make_packet(index, rest)) is None
+    baseline = converter.observe(make_packet(100, rest))
+
+    unity_left = identity47()
+    unity_left[:17] = [0.0, -0.25881904, 0.0, 0.9659258]
+    left = converter.observe(make_packet(101, unity_left))
+
+    unity_right = identity47()
+    unity_right[:17] = [0.0, 0.25881904, 0.0, 0.9659258]
+    right = converter.observe(make_packet(102, unity_right))
+
+    baseline_yaw = Rotation.from_quat(
+        baseline.body_quat_w[[1, 2, 3, 0]]
+    ).as_euler("xyz")[2]
+    left_yaw = Rotation.from_quat(left.body_quat_w[[1, 2, 3, 0]]).as_euler(
+        "xyz"
+    )[2]
+    right_yaw = Rotation.from_quat(
+        right.body_quat_w[[1, 2, 3, 0]]
+    ).as_euler("xyz")[2]
+
+    assert left_yaw - baseline_yaw > 0.0
+    assert right_yaw - baseline_yaw < 0.0
+
+
 def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
     converter = ZeroLabMotionConverter()
     rest = identity47()
