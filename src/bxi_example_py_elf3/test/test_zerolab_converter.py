@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+import zerolab.converter as converter_module
 from zerolab.converter import (
     BODY_JOINT_COUNT,
     SMPL24_PARENTS,
@@ -53,6 +54,26 @@ def identity47():
     result = np.zeros((47, 4), dtype=np.float32)
     result[:, 3] = 1.0
     return result
+
+
+def test_unity_world_quaternions_to_xrt_reflects_normalized_components():
+    unity = np.array(
+        [[2.0, -3.0, 4.0, -5.0], [-6.0, 8.0, -10.0, 12.0]],
+        dtype=np.float64,
+    )
+    original = unity.copy()
+
+    actual = unity_world_quaternions_to_xrt(unity, (2, 4))
+
+    expected = original / np.linalg.norm(original, axis=1, keepdims=True)
+    expected[:, :2] *= -1.0
+    np.testing.assert_allclose(actual, expected.astype(np.float32), atol=1e-7)
+    np.testing.assert_array_equal(unity, original)
+    assert actual.dtype == np.float32
+    assert actual.flags.c_contiguous
+    np.testing.assert_allclose(
+        np.linalg.norm(actual.astype(np.float64), axis=1), 1.0, atol=1e-7
+    )
 
 
 def test_quaternion_sign_flip_is_continuous():
@@ -399,9 +420,10 @@ def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
     ).as_quat()
     output = converter.observe(make_packet(101, unity_yawed))
 
-    xrt_yawed = unity_world_quaternions_to_xrt(
-        unity_yawed, (47, 4)
-    )
+    xrt_yawed = unity_yawed.astype(np.float64, copy=True)
+    xrt_yawed /= np.linalg.norm(xrt_yawed, axis=1, keepdims=True)
+    xrt_yawed[:, :2] *= -1.0
+    xrt_yawed = np.ascontiguousarray(xrt_yawed, dtype=np.float32)
     virtual = synthesize_smpl_world_quats(
         apply_rest_alignment(xrt_yawed[:17], rest[:17])
     )
@@ -417,6 +439,32 @@ def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
         atol=1e-6,
     )
     assert not np.allclose(output.body_quat_w, t_pose.body_quat_w)
+
+
+def test_converter_reflects_only_local_root_translation_for_fk(monkeypatch):
+    converter = ZeroLabMotionConverter()
+    rest = identity47()
+    for index in range(100):
+        assert converter.observe(make_packet(index, rest)) is None
+
+    root = np.array([1.25, -2.5, 3.75], dtype=np.float32)
+    packet = make_packet(100, rest, root=root)
+    original_root = packet.root_translation.copy()
+    original_payload = packet.raw_payload
+    captured = {}
+    real_fk = converter_module.compute_from_body_poses
+
+    def capture_fk(parents, body_poses):
+        captured["root"] = body_poses[0, :3].copy()
+        return real_fk(parents, body_poses)
+
+    monkeypatch.setattr(converter_module, "compute_from_body_poses", capture_fk)
+
+    assert converter.observe(packet) is not None
+
+    np.testing.assert_array_equal(captured["root"], [1.25, -2.5, -3.75])
+    np.testing.assert_array_equal(packet.root_translation, original_root)
+    assert packet.raw_payload == original_payload
 
 
 def test_left_elbow_motion_changes_only_left_wrist_chain():
