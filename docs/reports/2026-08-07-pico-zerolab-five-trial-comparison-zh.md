@@ -44,6 +44,8 @@ Canonical stability 是人体参考低运动窗口统计，不是 MuJoCo 跌倒�
 
 Static 的三个共同稳定阶段中，T-pose 的 pose RMSE 为 13.731°，T 后自然站立为 30.582°，A-pose 为 23.754°；这是非同步跨 Trial 的名义姿态复现证据，不含时间延迟或逐帧差异。Single-joint 在 114.16 s 公共区间内估计延迟为 0 ms、相关系数 0.4795，pose/root/position RMSE 分别为 22.569°、6.694°、0.0831 m，动态姿态差异为 313.416°/s；双方 Replay 均为 5700 样本/113.98 s，PICO 有 23 个限位样本、ZeroLab 为 0。
 
+Dynamic、Combination 与 Body 也均只在各自同步配对的公共 canonical 时间轴内比较：Dynamic 的 pose/root/position RMSE 为 26.068°、10.204°、0.0942 m，动态姿态差异为 372.359°/s；Combination 的 pose RMSE 为 21.956°、动态姿态差异为 637.417°/s；采用 **60 帧**临时诊断标定的 Body 公共区间为 103.02 s，pose/root/position RMSE 为 24.775°、21.069°、0.1395 m，动态姿态差异为 380.618°/s。它们均为设备间转换流 agreement，而非绝对人体动捕精度。
+
 本节只在五组分别完成核对后，以场景限定的数值和方向性发现归纳重复差异；时序、静态姿态、动态平滑性与 Replay 安全性相互独立判断。
 
 ## 5. Static：PICO013 与 ZeroLab014 跨 Trial 对照
@@ -137,15 +139,73 @@ ZeroLab 的姿态速度、加速度和 jerk 分别约为 PICO 的 3.1、6.0 和 
 
 ## 7. Dynamic：同次配对录制
 
-本节按第 3 节口径呈现动态组证据，分别讨论快速动作的时序、姿态与位置速度、平滑性，以及 Sonic–MuJoCo 可执行性和安全性；仅单组出现的事件保持场景限定。
+Dynamic 是同次同步配对录制，以下 Timing、Agreement、Smoothness 与 Replay 只在本动态动作组内部比较；不把它们与其他组归并为设备总体排名。两侧完整 Replay 均为 6,383 样本，使用 50 Hz 控制率、10 个 substeps，且 `reference.source=live`。
+
+### 7.1 公共时间轴、canonical agreement 与动态差异
+
+公共 canonical 时间轴重采样为 50 Hz，是双方逐时刻比较的共同栅格，不代表原始接收节奏没有 Gap，也不能用重采样后的固定 20 ms 间隔掩盖原始 Gap。该组的主要一致性结果如下；它们只衡量两条 canonical 转换流的 agreement，不是任一设备相对于真人的绝对精度。
+
+| 指标（Dynamic 组内） | RMSE |
+|---|---:|
+| SMPL pose（°） | **26.068** |
+| root orientation（°） | **10.204** |
+| SMPL FK local position（m） | **0.0942** |
+| pose angular velocity（°/s） | **372.359** |
+
+动态姿态差异（pose angular velocity RMSE）达到 372.359°/s，说明两条人体参考在快速变化部分的差别不能由静态 pose RMSE 单独概括。ELF3 `joint_pos[29]` 的解释仍遵循第 3 节：仅六个 wrist 通道承载设备差异，29 DoF 整体值不能脱离该结构理解。
+
+### 7.2 平滑性
+
+在本 Dynamic 组内，ZeroLab 的姿态加速度与 jerk 均高于 PICO，表明其参考流在该快速动作中的高频变化更强。这是各自输入流的平滑性描述，不把它解释为跨组的总体结论或绝对动捕准确率。
+
+### 7.3 Sonic--MuJoCo Replay 与阈值事件
+
+双方 Replay 样本数、控制率、substeps 和 live reference 设置相同，故可并列检查本组各自 Sonic 目标的可执行性。PICO 的 `fell=true` 由 **sample 6157** 的最大倾角 **61.282°** 越过跌倒阈值触发；同一 Replay 的最低基座高度仍为 **0.813 m**。因此这是该判据下的阈值事件，**不能写成机器人倒地**。ZeroLab 未触发跌倒判定。Replay tracking 的表现只反映机器人跟踪各自 Sonic 目标的难度，不等价于真人动捕精度。
 
 ## 8. Combination：同次配对录制
 
-本节按第 3 节口径呈现组合动作证据。正文采用规范名称“Combination”，路径和数据源保留历史目录拼写 `combation8` 以保证可追溯性。
+Combination 是同次同步配对录制；正文采用规范名称“Combination”，路径和数据源保留历史目录拼写 `combation8` 以保证可追溯性。以下比较仅针对该组合动作组；两侧完整 Replay 均为 3,992 样本，使用 50 Hz 控制率、10 个 substeps，且 `reference.source=live`。
 
-## 9. Body：同次配对录制（60帧临时标定）
+### 8.1 原始 Timing 与公共时间轴
 
-本节按第 3 节口径呈现全身动作证据。所有比较和结论均注明其使用 60 帧临时标定配置，不能据此评价 100 帧正式配置的最终能力上限。
+ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap 占 **29.491%**。公共 canonical 时间轴虽重采样为 50 Hz，以支持同步逐帧 agreement，但这不改变、更不能掩盖上述原始接收率和 Gap。时序现象只与本 Combination 配对内的 PICO 流比较，不外推为其他场景的结论。
+
+### 8.2 Canonical 与动态 agreement
+
+| 指标（Combination 组内） | RMSE / 事件 |
+|---|---:|
+| SMPL pose（°） | **21.956** |
+| pose angular velocity（°/s） | **637.417** |
+| 最大单点 pose 误差 | **接近 180°** |
+
+637.417°/s 的动态姿态差异表明组合动作的瞬态差异显著；最大 pose 误差中存在接近 180° 的单点异常，故不能只以 RMSE 平均值淡化或删除该异常。以上 agreement 描述两条转换流彼此的一致性，并非相对于外部真值的绝对精度。
+
+### 8.3 Sonic--MuJoCo Replay
+
+两侧在本组 Replay 中均未触发跌倒判定。ZeroLab 的 tracking RMSE 为 **0.08833 rad**，略低于 PICO 的 **0.09144 rad**；这只说明机器人对这两条各自 Sonic 目标的跟踪结果不同，**不等于 ZeroLab 动捕更准确**。限位、接触等其它 Replay 维度也不合成为单一设备排名。
+
+## 9. Body：同次配对录制（60 帧临时诊断标定）
+
+**本节全部数值均来自 60 帧临时诊断标定配置。**Body 是同次同步配对录制，但这一临时配置不能用于评价 100 帧正式配置的最终能力上限，也不外推为任一设备的总体能力。两侧完整 Replay 均为 5,143 样本，使用 50 Hz 控制率、10 个 substeps，且 `reference.source=live`。
+
+### 9.1 原始 Timing 与 Alignment（60 帧临时诊断配置）
+
+在 **60 帧临时诊断配置** 下，公共区间为 **103.02 s**。ZeroLab 的原始平均接收率为 **35.700 Hz**，超过 30 ms 的原始 Gap 占 **37.55%**。为进行同步配对而重采样至 50 Hz 只定义公共比较栅格，不能抹去原始接收率和 Gap；这一时序结果不外推到 100 帧正式配置或其他动作组。
+
+### 9.2 Canonical 与动态 agreement（60 帧临时诊断配置）
+
+| 指标（Body 组内、60 帧临时诊断配置） | RMSE |
+|---|---:|
+| SMPL pose（°） | **24.775** |
+| root orientation（°） | **21.069** |
+| SMPL FK local position（m） | **0.1395** |
+| pose angular velocity（°/s） | **380.618** |
+
+这些结果仅是 **60 帧临时诊断配置** 下两条 canonical 转换流在本 Body 配对内的 agreement，不是绝对人体动捕精度，也不用于推断 100 帧正式标定的结果。380.618°/s 的动态姿态差异应与 pose、root 和位置 RMSE 分列阅读，不合成为跨组综合分数。
+
+### 9.3 Sonic--MuJoCo Replay（60 帧临时诊断配置）
+
+在 **60 帧临时诊断配置** 下，PICO 与 ZeroLab 的 Replay tracking RMSE 分别为 **0.11847 rad** 和 **0.13629 rad**；ZeroLab 有 **8 个限位样本**，两侧均未触发跌倒判定。这些 Replay 指标只描述机器人跟踪各自 Sonic 目标的难度和该临时配置下的安全诊断，不能解释为动捕绝对精度，更不能外推到 100 帧正式配置。
 
 ## 10. PICO 的优点与缺点
 
