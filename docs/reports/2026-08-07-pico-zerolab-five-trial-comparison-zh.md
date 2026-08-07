@@ -6,8 +6,8 @@
 
 - **接收质量按场景分化。**Single-joint 中 ZeroLab 的平均接收率和原始 Gap 占比优于 PICO（49.183 Hz、7.00% 对 48.589 Hz、11.98%），但在 Combination/Body 中降至 37.337/35.700 Hz，Gap 占比升至 29.491%/37.55%。
 - **Static 只支持名义姿态复现判断。**PICO013 与 ZeroLab014 是非同步跨 Trial；T、N_after_T、A 的 pose RMSE 分别为 13.731°、30.582°、23.754°，不能解释为逐帧误差或绝对精度。
-- **肩腕映射是共同校核项。**Single-joint 的右肩 RMSE 达 63.426°；六个 wrist 通道承载全部 ELF3 设备间差异，29 DoF 整体值受 23 个零通道稀释，但现有证据尚不能确认差异来自哪一侧或哪一环节。
-- **PICO 在已报告的多组 canonical 平滑性上更有优势。**Static 三阶段与 Single-joint 的 PICO 姿态加速度、jerk 均较低，Dynamic 也呈相同方向；该优势不等价于人体姿态更准确。
+- **肩腕映射是共同校核项。**Single-joint 的右肩 RMSE 达 63.426°；四组同步配对 metrics 中，六个 wrist 通道承载全部 ELF3 设备间差异，29 DoF 整体值受 23 个零通道稀释，但现有证据尚不能确认差异来自哪一设备或哪一环节。Static 冻结产物未保留六通道分解。
+- **PICO 在五组已展开的 canonical smoothness 指标上均较低。**Static 三阶段与四组同步配对都呈这一方向；它描述高频变化，不等价于人体姿态更准确，也不形成跨动作总分。
 - **Replay 易跟踪性没有单一赢家。**ZeroLab 在 Single-joint 和 Combination 的 tracking RMSE 较低；PICO 在 60 帧临时诊断 Body 中较低（0.11847 对 0.13629 rad）。
 - **Replay 安全事件也需分场景看。**ZeroLab 五组均未触发跌倒；PICO Dynamic 在 sample 6157 因 61.282° 倾角越阈值触发 `fell=true`，但最低基座高度仍为 0.813 m，不能表述为机器人倒地。
 - **限位结果需逐场景验收。**Single-joint 中 PICO/ZeroLab 为 23/0 个限位样本，Body 中 ZeroLab 有 8 个，Static 双方均为 0；不能据此形成跨动作安全排名。
@@ -38,11 +38,25 @@ Static 是相同名义动作的跨 Trial 对照，证据强度低于四组同步
 
 四组同步配对实验（Single-joint、Dynamic、Combination、Body）各自在公共 canonical 50 Hz 时间轴上独立报告：原始 Timing（样本数、时长、平均接收率、P95/最大帧间隔、超过 30 ms 的 Gap）；Alignment（公共区间、估计延迟、相关系数、质量标志）；Canonical Agreement（SMPL pose、root orientation、SMPL FK position、ELF3 canonical `joint_pos`）；Dynamic Agreement（姿态角速度与位置速度 RMSE）；Smoothness（姿态速度、加速度、jerk、位置加速度 RMS）；Replay（tracking RMSE/MAE/P95/Max、速度跟踪 RMSE、限位、跌倒、最低基座高度、最大倾角）。
 
-ELF3 canonical `joint_pos[29]` 中只有六个腕部通道出现设备差异，其余 23 个通道为零。因此 29 DoF 整体 RMSE 会被零通道稀释：报告同时保留整体值与六个 wrist DoF 单独结果，并优先以 wrist 指标解释设备差异。
+四组同步配对 metrics 的 ELF3 canonical `joint_pos[29]` 中只有六个腕部通道出现设备差异，其余 23 个通道为零。因此 29 DoF 整体 RMSE 会被零通道稀释：本报告对 Single-joint、Dynamic、Combination、Body 同时保留整体值与 `left wrist x/y/z`（canonical indices 19--21）、`right wrist x/y/z`（indices 26--28）的 RMSE。`left/right` 只标识人体侧别，不把差异归因到 PICO 或 ZeroLab。Static 的冻结跨 Trial 产物只保留每阶段 29 DoF 整体统计，六通道分解不可用，见 5.1 节。
 
 Canonical stability 是人体参考低运动窗口统计，不是 MuJoCo 跌倒判定；Replay stability 才包含 `fell`、基座高度和最大倾角。`contact_count` 是任意接触的仿真子步数，受时长和 substeps 影响；`self_collision_count` 是接触事件累计值，非唯一自碰撞次数。两者跨时长只作风险提示，不作主排名指标。
 
 ## 4. 五组核心结果总览
+
+下表只作组内定量索引，不跨动作平均或合成总分。Static 的前三项按 T/N_after_T/A 名义阶段顺序列出；它不是同步逐帧 aggregate。Replay 列始终按 PICO / ZeroLab 排列。
+
+| 组别 | 比较方式 / 配置 | pose RMSE（°） | root RMSE（°） | position RMSE（m） | pose 速度差异（°/s） | Replay tracking RMSE（rad） | 限位 / `fell`（PICO；ZeroLab） |
+|---|---|---:|---:|---:|---:|---:|---|
+| Static | **非同步跨 Trial**；T/N_after_T/A 名义阶段 | 13.731 / 30.582 / 23.754 | 4.375 / 5.423 / 6.181 | 0.0701 / 0.0915 / 0.1103 | — | 0.0560 / 0.0530¹ | 0 / 否；0 / 否 |
+| Single-joint | 同次配对；100 帧标定 | 22.569 | 6.694 | 0.0831 | 313.416 | 0.0693 / 0.0644 | 23 / 否；0 / 否 |
+| Dynamic | 同次配对；100 帧标定 | 26.068 | 10.204 | 0.0942 | 372.359 | 0.08105 / 0.08905 | 0 / 是；0 / 否 |
+| Combination | 同次配对；100 帧标定 | 21.956 | 10.369 | 0.0875 | 637.417 | 0.09144 / 0.08833 | 0 / 否；0 / 否 |
+| Body | 同次配对；**60 帧临时诊断标定** | 24.775 | 21.069 | 0.1395 | 380.618 | 0.11847 / 0.13629 | 0 / 否；8 / 否 |
+
+¹ Static 两侧 Replay 覆盖范围不同（PICO 2222 样本/44.42 s，ZeroLab 1653 样本/33.04 s），仅并列各自结果，不作同范围排名。Static 因非同步而没有有效的逐帧 pose 速度差异，故记为 `—`。
+
+证据归并入口如下；详细字段与解释限制见各组章节。
 
 | 组别 | 配对属性 | 结果归并规则 | 证据入口 |
 |---|---|---|---|
@@ -72,7 +86,7 @@ PICO013 与 ZeroLab014 不是同步录制。故本节只把可识别的相同名
 | N_after_T（140 / 2.78 s） | 30.582 / 80.018 / 89.340 | 5.423 / 5.759 / 5.793 | 0.0915 / 0.1648 / 0.1996 | 0.3912 / 1.4299 / 1.5252 |
 | A（375 / 7.48 s） | 23.754 / 50.010 / 66.552 | 6.181 / 8.004 / 8.163 | 0.1103 / 0.2268 / 0.3088 | 0.2253 / 0.7766 / 0.9819 |
 
-T 的名义姿态最接近；N_after_T 的 pose 与 ELF3 差异最大，A 居中。ELF3 29 维整体值需要谨慎解读：只有 6 个 wrist 通道在设备间出现差异，另 23 个通道恒为零，整体 RMSE 会被零通道稀释。因此它用于确认腕部目标是否一致，而不能脱离 wrist 通道单独解释为 29 DoF 全身精度。
+T 的名义姿态最接近；N_after_T 的 pose 与 ELF3 29 DoF 整体差异最大，A 居中。冻结的 `comparison_analysis.json` 在 T、N_after_T、A 中只保留 `elf3_29_overall` 的 mean/RMSE/P95/max，没有六个 wrist 通道字段，也没有记录精确配对阶段的行边界；可追溯的两份 canonical NPZ metadata 同样没有阶段标签。因此 **Static 六通道分解不可用**，不能靠总体值或样本数反推。若要获得带标签的 `left wrist x/y/z` 与 `right wrist x/y/z`，必须从 canonical 阶段数据重新生成分阶段分析，并把阶段边界和逐通道统计固化到产物中。现有 29 DoF 整体值不能解释为全身精度。
 
 ### 5.2 名义稳定段平滑性
 
@@ -127,7 +141,19 @@ Static 组只能说明两条转换流对 T、自然站立和 A 三种名义姿�
 | pose angular velocity（°/s） | **313.416** | — | — |
 | position velocity（m/s） | 0.3158 | — | — |
 
-右肩是 pose 逐关节 RMSE 最大的关节（63.426°），是本组 22.569°整体 pose RMSE 的主要局部误差来源。ELF3 的 29 维整体结果同样由 6 个 wrist 通道承载全部非零差异、其余 23 通道为零；六个 wrist 通道的 RMSE 依次为 0.6804、0.2880、0.2023、0.1498、0.5192、0.2746 rad，故不以被稀释的 29 维整体值替代腕部解释。上述 agreement 是两条转换流之间的一致性，仍非对真人的绝对精度。
+右肩是 pose 逐关节 RMSE 最大的关节（63.426°），是本组 22.569°整体 pose RMSE 的主要局部误差来源。ELF3 29 DoF 整体与带标签 wrist RMSE 如下；其余 23 个通道为零。
+
+| ELF3 canonical 通道 | canonical index | RMSE（rad） |
+|---|---:|---:|
+| 29 DoF overall | 0--28 | 0.1814 |
+| left wrist x | 19 | 0.6804 |
+| left wrist y | 20 | 0.2880 |
+| left wrist z | 21 | 0.2023 |
+| right wrist x | 26 | 0.1498 |
+| right wrist y | 27 | 0.5192 |
+| right wrist z | 28 | 0.2746 |
+
+29 DoF overall 会被 23 个零通道稀释，故不能替代 wrist 分解。`left/right` 是人体侧别；这些对称 agreement 误差仍不能归因到 PICO、ZeroLab 或某个转换环节，也不是对真人的绝对精度。
 
 ### 6.3 平滑性与低运动窗口
 
@@ -151,24 +177,60 @@ ZeroLab 的姿态速度、加速度和 jerk 分别约为 PICO 的 3.1、6.0 和 
 
 Dynamic 是同次同步配对录制，以下 Timing、Agreement、Smoothness 与 Replay 只在本动态动作组内部比较；不把它们与其他组归并为设备总体排名。两侧完整 Replay 均为 6,383 样本，使用 50 Hz 控制率、10 个 substeps，且 `reference.source=live`。
 
-### 7.1 公共时间轴、canonical agreement 与动态差异
+### 7.1 原始 Timing 与 Alignment
 
-公共 canonical 时间轴重采样为 50 Hz，是双方逐时刻比较的共同栅格，不代表原始接收节奏没有 Gap，也不能用重采样后的固定 20 ms 间隔掩盖原始 Gap。该组的主要一致性结果如下；它们只衡量两条 canonical 转换流的 agreement，不是任一设备相对于真人的绝对精度。
+| 流 | 原始样本 | 原始时长（s） | 平均接收率（Hz） | P95 帧间隔（ms） | 最大帧间隔（ms） | 超过 30 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| PICO | 6,265 | 127.832 | 49.002 | 32.751 | 283.142 | 640（10.22%） |
+| ZeroLab | 6,673 | 140.339 | 47.542 | 35.463 | 237.911 | 558（8.36%） |
 
-| 指标（Dynamic 组内） | RMSE |
+| 公共区间 / 栅格样本 | 相关系数 | 估计延迟 | 标定帧数 | quality flags | 对齐栅格 |
+|---|---:|---:|---:|---|---|
+| 127.82 s / 6392 | 0.6197 | 0 ms | 100 | 无（`[]`） | 双方 50 Hz |
+
+对齐后的双方栅格均为 **50 Hz**、P95 间隔 20 ms、超过 30 ms 的间隔为 0；这些固定间隔只来自重采样，不能替代上表原始接收节奏。
+
+### 7.2 Canonical 与动态 agreement
+
+| 指标（Dynamic 组内） | Mean | RMSE | P95 | 最大值 |
+|---|---:|---:|---:|---:|
+| SMPL pose（°） | 19.294 | **26.068** | 56.395 | 117.201 |
+| root orientation（°） | 9.604 | **10.204** | 15.965 | 23.222 |
+| SMPL FK local position（m） | 0.0844 | **0.0942** | 0.1612 | 0.3715 |
+| ELF3 `joint_pos[29]`（rad） | 0.1013 | **0.2732** | 0.8110 | 2.0488 |
+
+| 动态差异（Dynamic 组内） | RMSE |
 |---|---:|
-| SMPL pose（°） | **26.068** |
-| root orientation（°） | **10.204** |
-| SMPL FK local position（m） | **0.0942** |
 | pose angular velocity（°/s） | **372.359** |
+| position velocity（m/s） | **0.3868** |
 
-动态姿态差异（pose angular velocity RMSE）达到 372.359°/s，说明两条人体参考在快速变化部分的差别不能由静态 pose RMSE 单独概括。ELF3 `joint_pos[29]` 的解释仍遵循第 3 节：仅六个 wrist 通道承载设备差异，29 DoF 整体值不能脱离该结构理解。
+| ELF3 canonical 通道 | canonical index | RMSE（rad） |
+|---|---:|---:|
+| 29 DoF overall | 0--28 | 0.2732 |
+| left wrist x | 19 | 1.0294 |
+| left wrist y | 20 | 0.3665 |
+| left wrist z | 21 | 0.3385 |
+| right wrist x | 26 | 0.3975 |
+| right wrist y | 27 | 0.7904 |
+| right wrist z | 28 | 0.2705 |
 
-### 7.2 平滑性
+动态姿态差异达到 372.359°/s，说明两条人体参考在快速变化部分的差别不能由 pose RMSE 单独概括。29 DoF overall 受 23 个零通道稀释；带标签的 wrist 值只定位人体侧别与轴向，不能把差异归因到任一设备。以上均为两条转换流的 agreement，不是相对于真人的绝对精度。
 
-在本 Dynamic 组内，ZeroLab 的姿态加速度与 jerk 均高于 PICO，表明其参考流在该快速动作中的高频变化更强。这是各自输入流的平滑性描述，不把它解释为跨组的总体结论或绝对动捕准确率。
+### 7.3 平滑性
 
-### 7.3 Sonic--MuJoCo Replay 与阈值事件
+| 流 | pose 速度 RMS（°/s） | pose 加速度 RMS（°/s²） | pose jerk RMS（°/s³） | 位置加速度 RMS（m/s²） |
+|---|---:|---:|---:|---:|
+| PICO | 45.467 | 1,202.905 | 101,094.035 | 6.348 |
+| ZeroLab | 85.635 | 3,815.136 | 318,147.541 | 12.599 |
+
+在本 Dynamic 组内，ZeroLab 的姿态速度、加速度、jerk 与位置加速度均高于 PICO，表明其参考流在该快速动作中的高频变化更强。这是各自输入流的平滑性描述，不把它解释为跨组的总体结论或绝对动捕准确率。
+
+### 7.4 Sonic--MuJoCo Replay 与阈值事件
+
+| Replay | 样本 / 时长 | tracking RMSE（rad） | MAE / P95 / 最大误差（rad） | 速度 tracking RMSE（rad/s） | 最大实际速度（rad/s） | 限位样本 | `fell` | 最低基座高度（m） | 最大倾角（°） |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PICO | 6383 / 127.64 s | 0.08105 | 0.0421 / 0.1557 / 1.4921 | 0.7133 | 9.1649 | 0 | 是（sample 6157） | 0.8130 | 61.282 |
+| ZeroLab | 6383 / 127.64 s | 0.08905 | 0.0472 / 0.1734 / 2.0133 | 0.7281 | 9.0208 | 0 | 否 | 0.8499 | 46.598 |
 
 双方 Replay 样本数、控制率、substeps 和 live reference 设置相同，故可并列检查本组各自 Sonic 目标的可执行性。PICO 的 `fell=true` 由 **sample 6157** 的最大倾角 **61.282°** 越过跌倒阈值触发；同一 Replay 的最低基座高度仍为 **0.813 m**。因此这是该判据下的阈值事件，**不能写成机器人倒地**。ZeroLab 未触发跌倒判定。Replay tracking 的表现只反映机器人跟踪各自 Sonic 目标的难度，不等价于真人动捕精度。
 
@@ -176,23 +238,62 @@ Dynamic 是同次同步配对录制，以下 Timing、Agreement、Smoothness 与
 
 Combination 是同次同步配对录制；正文采用规范名称“Combination”，路径和数据源保留历史目录拼写 `combation8` 以保证可追溯性。以下比较仅针对该组合动作组；两侧完整 Replay 均为 3,992 样本，使用 50 Hz 控制率、10 个 substeps，且 `reference.source=live`。
 
-### 8.1 原始 Timing 与公共时间轴
+### 8.1 原始 Timing 与 Alignment
 
-ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap 占 **29.491%**。公共 canonical 时间轴虽重采样为 50 Hz，以支持同步逐帧 agreement，但这不改变、更不能掩盖上述原始接收率和 Gap。时序现象只与本 Combination 配对内的 PICO 流比较，不外推为其他场景的结论。
+| 流 | 原始样本 | 原始时长（s） | 平均接收率（Hz） | P95 帧间隔（ms） | 最大帧间隔（ms） | 超过 30 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| PICO | 4,387 | 88.291 | 49.677 | 28.141 | 103.798 | 183（4.17%） |
+| ZeroLab | 3,436 | 92.001 | 37.337 | 70.928 | 433.250 | 1,013（29.49%） |
+
+| 公共区间 / 栅格样本 | 相关系数 | 估计延迟 | 标定帧数 | quality flags | 对齐栅格 |
+|---|---:|---:|---:|---|---|
+| 80.00 s / 4001 | 0.5025 | -20 ms¹ | 100 | 无（`[]`） | 双方 50 Hz |
+
+¹ 延迟符号定义为将 ZeroLab 时间戳提前该估计值。对齐后的双方栅格均为 **50 Hz**、P95 间隔 20 ms、超过 30 ms 的间隔为 0。该重采样结果不改变、更不能掩盖 ZeroLab 原始 37.337 Hz 与 29.491% Gap，也不外推为其他场景的结论。
 
 ### 8.2 Canonical 与动态 agreement
 
-| 指标（Combination 组内） | RMSE / 事件 |
+| 指标（Combination 组内） | Mean | RMSE | P95 | 最大值 |
+|---|---:|---:|---:|---:|
+| SMPL pose（°） | 16.085 | **21.956** | 46.850 | 179.986 |
+| root orientation（°） | 9.332 | **10.369** | 18.128 | 24.535 |
+| SMPL FK local position（m） | 0.0757 | **0.0875** | 0.1640 | 0.3219 |
+| ELF3 `joint_pos[29]`（rad） | 0.0792 | **0.1980** | 0.5528 | 1.1827 |
+
+| 动态差异（Combination 组内） | RMSE |
 |---|---:|
-| SMPL pose（°） | **21.956** |
 | pose angular velocity（°/s） | **637.417** |
-| 最大单点 pose 误差 | **接近 180°** |
+| position velocity（m/s） | **0.4432** |
 
-637.417°/s 的动态姿态差异表明组合动作的瞬态差异显著；最大 pose 误差中存在接近 180° 的单点异常，故不能只以 RMSE 平均值淡化或删除该异常。以上 agreement 描述两条转换流彼此的一致性，并非相对于外部真值的绝对精度。
+| ELF3 canonical 通道 | canonical index | RMSE（rad） |
+|---|---:|---:|
+| 29 DoF overall | 0--28 | 0.1980 |
+| left wrist x | 19 | 0.6041 |
+| left wrist y | 20 | 0.4054 |
+| left wrist z | 21 | 0.3163 |
+| right wrist x | 26 | 0.2869 |
+| right wrist y | 27 | 0.5802 |
+| right wrist z | 28 | 0.2984 |
 
-### 8.3 Sonic--MuJoCo Replay
+637.417°/s 的动态姿态差异表明组合动作的瞬态差异显著；最大 pose 误差为 179.986°，存在接近 180° 的单点异常，故不能只以 RMSE 平均值淡化或删除该异常。29 DoF overall 受 23 个零通道稀释；wrist 侧别/轴向标签不构成设备归因。以上 agreement 描述两条转换流彼此的一致性，并非相对于外部真值的绝对精度。
 
-两侧在本组 Replay 中均未触发跌倒判定。ZeroLab 的 tracking RMSE 为 **0.08833 rad**，略低于 PICO 的 **0.09144 rad**；这只说明机器人对这两条各自 Sonic 目标的跟踪结果不同，**不等于 ZeroLab 动捕更准确**。限位、接触等其它 Replay 维度也不合成为单一设备排名。
+### 8.3 平滑性
+
+| 流 | pose 速度 RMS（°/s） | pose 加速度 RMS（°/s²） | pose jerk RMS（°/s³） | 位置加速度 RMS（m/s²） |
+|---|---:|---:|---:|---:|
+| PICO | 33.814 | 760.877 | 61,242.544 | 6.097 |
+| ZeroLab | 140.071 | 6,461.319 | 505,382.164 | 15.053 |
+
+本组四项 smoothness 均为 PICO 较低；这只描述 Combination 参考流的高频变化，不证明动作幅值或人体姿态更正确。
+
+### 8.4 Sonic--MuJoCo Replay
+
+| Replay | 样本 / 时长 | tracking RMSE（rad） | MAE / P95 / 最大误差（rad） | 速度 tracking RMSE（rad/s） | 最大实际速度（rad/s） | 限位样本 | `fell` | 最低基座高度（m） | 最大倾角（°） |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PICO | 3992 / 79.82 s | 0.09144 | 0.0465 / 0.1822 / 1.3606 | 0.8277 | 6.7280 | 0 | 否 | 0.7801 | 54.487 |
+| ZeroLab | 3992 / 79.82 s | 0.08833 | 0.0463 / 0.1710 / 1.2794 | 0.7268 | 7.5486 | 0 | 否 | 0.8231 | 52.043 |
+
+两侧在本组 Replay 中均未越限或触发跌倒判定。ZeroLab 的 tracking RMSE 为 **0.08833 rad**，略低于 PICO 的 **0.09144 rad**；这只说明机器人对这两条各自 Sonic 目标的跟踪结果不同，**不等于 ZeroLab 动捕更准确**，也不把 Replay 维度合成为单一设备排名。
 
 ## 9. Body：同次配对录制（60 帧临时诊断标定）
 
@@ -200,30 +301,68 @@ ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap �
 
 ### 9.1 原始 Timing 与 Alignment（60 帧临时诊断配置）
 
-在 **60 帧临时诊断配置** 下，公共区间为 **103.02 s**。ZeroLab 的原始平均接收率为 **35.700 Hz**，超过 30 ms 的原始 Gap 占 **37.55%**。为进行同步配对而重采样至 50 Hz 只定义公共比较栅格，不能抹去原始接收率和 Gap；这一时序结果不外推到 100 帧正式配置或其他动作组。
+| 流（60 帧临时诊断配置） | 原始样本 | 原始时长（s） | 平均接收率（Hz） | P95 帧间隔（ms） | 最大帧间隔（ms） | 超过 30 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| PICO | 5,103 | 103.044 | 49.513 | 31.785 | 130.510 | 318（6.23%） |
+| ZeroLab | 3,764 | 105.405 | 35.700 | 60.945 | 243.412 | 1,413（37.55%） |
+
+| 公共区间 / 栅格样本（60 帧临时诊断配置） | 相关系数 | 估计延迟 | 标定帧数 | quality flags | 对齐栅格 |
+|---|---:|---:|---:|---|---|
+| 103.02 s / 5152 | 0.6518 | 0 ms | 60 | 无（`[]`） | 双方 50 Hz |
+
+对齐后的双方栅格均为 **50 Hz**、P95 间隔 20 ms、超过 30 ms 的间隔为 0；这只定义公共比较栅格，不能抹去原始接收率和 Gap，也不外推到 100 帧正式配置或其他动作组。
 
 ### 9.2 Canonical 与动态 agreement（60 帧临时诊断配置）
 
-| 指标（Body 组内、60 帧临时诊断配置） | RMSE |
+| 指标（Body 组内、60 帧临时诊断配置） | Mean | RMSE | P95 | 最大值 |
+|---|---:|---:|---:|---:|
+| SMPL pose（°） | 18.176 | **24.775** | 57.738 | 110.821 |
+| root orientation（°） | 20.615 | **21.069** | 28.411 | 37.227 |
+| SMPL FK local position（m） | 0.1303 | **0.1395** | 0.2131 | 0.4291 |
+| ELF3 `joint_pos[29]`（rad） | 0.0657 | **0.1883** | 0.4237 | 1.3055 |
+
+| 动态差异（Body 组内、60 帧临时诊断配置） | RMSE |
 |---|---:|
-| SMPL pose（°） | **24.775** |
-| root orientation（°） | **21.069** |
-| SMPL FK local position（m） | **0.1395** |
 | pose angular velocity（°/s） | **380.618** |
+| position velocity（m/s） | **0.4787** |
 
-这些结果仅是 **60 帧临时诊断配置** 下两条 canonical 转换流在本 Body 配对内的 agreement，不是绝对人体动捕精度，也不用于推断 100 帧正式标定的结果。380.618°/s 的动态姿态差异应与 pose、root 和位置 RMSE 分列阅读，不合成为跨组综合分数。
+| ELF3 canonical 通道（60 帧临时诊断配置） | canonical index | RMSE（rad） |
+|---|---:|---:|
+| 29 DoF overall | 0--28 | 0.1883 |
+| left wrist x | 19 | 0.3673 |
+| left wrist y | 20 | 0.2584 |
+| left wrist z | 21 | 0.2454 |
+| right wrist x | 26 | 0.2696 |
+| right wrist y | 27 | 0.8024 |
+| right wrist z | 28 | 0.2235 |
 
-### 9.3 Sonic--MuJoCo Replay（60 帧临时诊断配置）
+这些结果仅是 **60 帧临时诊断配置** 下两条 canonical 转换流在本 Body 配对内的 agreement，不是绝对人体动捕精度，也不用于推断 100 帧正式标定的结果。380.618°/s 的动态姿态差异应与 pose、root、位置和 wrist RMSE 分列阅读；wrist 标签不构成设备归因，也不合成为跨组综合分数。
 
-在 **60 帧临时诊断配置** 下，PICO 与 ZeroLab 的 Replay tracking RMSE 分别为 **0.11847 rad** 和 **0.13629 rad**；ZeroLab 有 **8 个限位样本**，两侧均未触发跌倒判定。这些 Replay 指标只描述机器人跟踪各自 Sonic 目标的难度和该临时配置下的安全诊断，不能解释为动捕绝对精度，更不能外推到 100 帧正式配置。
+### 9.3 平滑性（60 帧临时诊断配置）
+
+| 流（60 帧临时诊断配置） | pose 速度 RMS（°/s） | pose 加速度 RMS（°/s²） | pose jerk RMS（°/s³） | 位置加速度 RMS（m/s²） |
+|---|---:|---:|---:|---:|
+| PICO | 54.508 | 1,284.599 | 100,453.660 | 6.299 |
+| ZeroLab | 89.974 | 3,690.312 | 307,885.714 | 14.753 |
+
+本组四项 smoothness 均为 PICO 较低；该方向只适用于 **60 帧临时诊断配置** 下的 Body 参考流，不代表 100 帧正式配置或绝对人体动捕精度。
+
+### 9.4 Sonic--MuJoCo Replay（60 帧临时诊断配置）
+
+| Replay（60 帧临时诊断配置） | 样本 / 时长 | tracking RMSE（rad） | MAE / P95 / 最大误差（rad） | 速度 tracking RMSE（rad/s） | 最大实际速度（rad/s） | 限位样本 | `fell` | 最低基座高度（m） | 最大倾角（°） |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PICO | 5143 / 102.84 s | 0.11847 | 0.0562 / 0.2104 / 1.5928 | 1.1248 | 11.3571 | 0 | 否 | 1.0015 | 19.029 |
+| ZeroLab | 5143 / 102.84 s | 0.13629 | 0.0644 / 0.2408 / 2.2563 | 1.7488 | 13.2120 | 8 | 否 | 0.9547 | 22.056 |
+
+在 **60 帧临时诊断配置** 下，PICO 的 Replay tracking RMSE 为 **0.11847 rad**，ZeroLab 为 **0.13629 rad**；ZeroLab 有 **8 个限位样本**，两侧均未触发跌倒判定。这些 Replay 指标只描述机器人跟踪各自 Sonic 目标的难度和该临时配置下的安全诊断，不能解释为动捕绝对精度，更不能外推到 100 帧正式配置。
 
 ## 10. PICO 的优点与缺点
 
 本节仅从五组中重复出现且可由固定证据追溯的现象归纳 PICO 的优点、局限与适用条件；不以单一指标替代其他维度，也不作绝对准确度声明。
 
-- **数据接收。**现有展开数字不足以形成 PICO 接收优势：Combination/Body 只证明 ZeroLab 分别出现 37.337/35.700 Hz、原始 Gap 占 29.491%/37.55% 的连续输入风险，没有章节内 PICO 同组 timing 对照或预定义判负阈值，不能据此推荐 PICO。已具同组数字的 Single-joint 中，PICO 接收率为 48.589 Hz、Gap 占 11.98%，均弱于 ZeroLab 的 49.183 Hz、7.00%。
+- **数据接收。**Combination/Body 的同组原始 timing 中，PICO 为 49.677/49.513 Hz、超过 30 ms 的 Gap 占 4.17%/6.23%，ZeroLab 为 37.337/35.700 Hz、29.49%/37.55%；PICO 在这两个配对中更连续，但没有预定义判负阈值且每个场景只有一次 Trial，不能据此形成跨动作推荐。Single-joint 的方向相反：PICO 为 48.589 Hz、11.98%，弱于 ZeroLab 的 49.183 Hz、7.00%。
 - **姿态。**Static 的 T 阶段设备间 pose RMSE 为 13.731°，低于 N_after_T 的 30.582°和 A 的 23.754°，说明两条流在标准 T 名义姿态上更接近。缺点是该指标为双方 agreement，不能将较小差异单独归功于 PICO；Single-joint 的右肩 63.426° RMSE 和六个非零 wrist 差异通道要求先校核两侧肩腕映射并拆分差异来源，确认后再修正。
-- **动态平滑。**这是 PICO 最稳定的相对优势：Static 三阶段的 pose 加速度 RMS 为 ZeroLab 的约 1/3.4 至 1/10.5，jerk 为约 1/4.0 至 1/11.5；Single-joint 的姿态加速度/jerk 为 642.300/53,270.909，对方为 3,847.818/319,723.356，Dynamic 也呈 PICO 较低的方向。限制是平滑只描述高频变化，不证明动作幅值或真人姿态更正确。
+- **动态平滑。**这是 PICO 最一致的相对方向：Static 三阶段的 pose 加速度 RMS 为 ZeroLab 的约 1/3.4 至 1/10.5，jerk 为约 1/4.0 至 1/11.5；Single-joint 的姿态加速度/jerk 为 642.300/53,270.909，对方为 3,847.818/319,723.356，Dynamic、Combination 和 60 帧临时诊断 Body 的四项 smoothness 也均为 PICO 较低。限制是平滑只描述高频变化，不证明动作幅值或真人姿态更正确。
 - **Replay。**优点是 60 帧临时诊断 Body 的 tracking RMSE 较低（0.11847 对 0.13629 rad），Single-joint 的最大误差也较低（1.3889 对 1.8996 rad）。缺点是 Single-joint 的 RMSE、P95、速度 RMSE 均高于 ZeroLab，Combination tracking RMSE 也略高（0.09144 对 0.08833 rad）。
 - **安全性。**Static 无限位、无跌倒，Body 未跌倒。缺点是 Single-joint 出现 23 个限位样本，而 ZeroLab 为 0；Dynamic 在 sample 6157 因最大倾角 61.282°触发 `fell=true`。该事件是阈值触发且最低基座高度仍为 0.813 m，不能扩大为真实倒地结论。
 - **部署条件。**现有证据仅覆盖固定离线产物和 live reference Replay，未量化佩戴、遮挡、传感器数量、搭建时间或现场维护成本，因此不能从本报告给 PICO 部署便利性排序；工程选型需另行实测这些条件。
@@ -232,9 +371,9 @@ ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap �
 
 本节仅从五组中重复出现且可由固定证据追溯的现象归纳 ZeroLab 的优点、局限与适用条件；较低 Replay tracking RMSE 只表示该段目标更易被机器人跟踪，不表示更接近真人动作。
 
-- **数据接收。**优点是 Single-joint 的平均接收率为 49.183 Hz，原始 Gap 占 7.00%，优于同组 PICO 的 48.589 Hz 和 11.98%。缺点是在 Combination/Body 中分别降至 37.337/35.700 Hz，超过 30 ms 的原始 Gap 升至 29.491%/37.55%，对依赖连续实时输入的任务构成直接限制。
+- **数据接收。**优点是 Single-joint 的平均接收率为 49.183 Hz，原始 Gap 占 7.00%，优于同组 PICO 的 48.589 Hz 和 11.98%。缺点是在 Combination/Body 中分别降至 37.337/35.700 Hz，超过 30 ms 的原始 Gap 升至 29.49%/37.55%，而同组 PICO 为 49.677/49.513 Hz、4.17%/6.23%；这对依赖连续实时输入的任务构成需复测的场景风险，而非单 Trial 的设备总评。
 - **姿态。**Static 的 T/N_after_T/A pose agreement 为 13.731°/30.582°/23.754°，Single-joint 的位置 RMSE 为 0.0831 m；这些数值证明两条流仍有明显场景差异。缺点与 PICO 相同：右肩 63.426° RMSE、六个 wrist 通道非零差异和快速动作的高动态误差尚不能归因到单侧设备，必须通过外部真值或受控映射实验拆分来源。
-- **动态平滑。**当前主要缺点是已报告多组的高频变化更强：Static 三阶段 pose 加速度为 PICO 的约 3.4–10.5 倍、jerk 为约 4.0–11.5 倍；Single-joint 的姿态加速度和 jerk 均约为 PICO 的 6.0 倍，Dynamic 亦高于 PICO。平滑性较弱不等价于绝对姿态误差更大。
+- **动态平滑。**当前主要缺点是五组已展开指标的高频变化更强：Static 三阶段 pose 加速度为 PICO 的约 3.4–10.5 倍、jerk 为约 4.0–11.5 倍；Single-joint 的姿态加速度和 jerk 均约为 PICO 的 6.0 倍，Dynamic、Combination 和 60 帧临时诊断 Body 的四项 smoothness 也均高于 PICO。平滑性较弱不等价于绝对姿态误差更大。
 - **Replay。**优点是 Single-joint 的 tracking RMSE/速度 RMSE 为 0.0644 rad/0.5746 rad/s，低于 PICO 的 0.0693/0.6973；Combination 的 0.08833 rad 也略低于 PICO 的 0.09144。缺点是 60 帧临时诊断 Body 的 RMSE 较高（0.13629 对 0.11847 rad），Static 的三个阶段也有胜有负，不能外推为普遍更易跟踪。
 - **安全性。**五组均未触发跌倒，Single-joint 为 0 个限位样本，Static 也无限位。缺点是 60 帧临时诊断 Body 有 8 个限位样本；此外，`fell`、限位、最大倾角和 tracking 误差是不同维度，不能因“未跌倒”就忽略其它风险信号。
 - **部署条件。**当前录制没有给出佩戴、遮挡、传感器数量、布置时间或环境适应性的量化对照，因此不对 ZeroLab 的部署门槛作数据外推；尤其不能用 Combination/Body 的接收抖动替代专门的遮挡或佩戴实验。
@@ -245,7 +384,7 @@ ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap �
 
 | 场景 / 维度 | 建议 | 数据依据 | 适用限制 |
 |---|---|---|---|
-| 稳定采集和动态平滑 | 连续实时输入任务需重点验证 ZeroLab 在 Combination/Body 暴露的接收风险，但不据此推荐 PICO；平滑目标优先时可基于已报告 smoothness 评估 PICO。 | ZeroLab 在 Combination/Body 为 37.337/35.700 Hz、Gap 占 29.491%/37.55%；PICO 在 Static 三阶段、Single-joint 和 Dynamic 的已报告平滑性均较好。Single-joint 的同组 timing 则是 ZeroLab 49.183 Hz、7.00% 优于 PICO 48.589 Hz、11.98%。 | Combination/Body 正文没有 PICO 同组 timing，且未定义单独判负阈值；平滑性不代表绝对精度，50 Hz 重采样结果也不能替代原始 Gap。 |
+| 稳定采集和动态平滑 | 连续实时输入任务需重点复测 Combination/Body 的接收差异；这两组可评估 PICO，Single-joint 则可评估 ZeroLab。平滑目标优先时可基于组内 smoothness 评估 PICO。 | Combination/Body 的 PICO 为 49.677/49.513 Hz、Gap 占 4.17%/6.23%，ZeroLab 为 37.337/35.700 Hz、29.49%/37.55%；Single-joint 的方向相反，为 ZeroLab 49.183 Hz、7.00% 优于 PICO 48.589 Hz、11.98%。PICO 在五组已展开的组内 smoothness 均较低。 | 每个场景只有一次 Trial，且未定义单独判负阈值；平滑性不代表绝对精度，50 Hz 重采样结果也不能替代原始 Gap。 |
 | 静态名义姿态 | T-pose 复现可作为双方标定检查点；需要更平滑的稳定姿态输入时优先试 PICO，但不据此选择“更准确”的设备。 | Static T/N_after_T/A 的 pose RMSE 为 13.731°/30.582°/23.754°；三阶段 PICO 的 pose 加速度和 jerk 均低于 ZeroLab。 | PICO013/ZeroLab014 为非同步跨 Trial；只比较共同名义阶段，不能报告时序、逐帧误差或单侧绝对精度。 |
 | 单关节与末端 | 机器人跟踪和限位优先时，Single-joint 可评估 ZeroLab；无论设备，先校核肩腕映射并拆分差异来源，确认后再修正。 | ZeroLab/PICO tracking RMSE 为 0.0644/0.0693 rad、限位为 0/23；右肩 RMSE 63.426°，位置 RMSE 0.0831 m，六个 wrist 通道均有非零差异。 | tracking 是各自目标的可跟踪性；肩腕 agreement 差异不能定位到单侧硬件、算法或映射环节。 |
 | 复杂动作 | 没有跨 Dynamic、Combination、Body 的统一赢家：输入平滑优先时评估 PICO；Dynamic 的跌倒阈值与 Combination 的易跟踪性优先时评估 ZeroLab；Body 临时配置下则先评估 PICO Replay。 | 三组动态姿态差异为 372.359/637.417/380.618°/s；ZeroLab Dynamic 未触发跌倒且 Combination RMSE 较低，PICO Body RMSE 较低，ZeroLab Body 有 8 个限位样本。 | Combination 有接近 180° 的单点异常；Body 仅为 60 帧临时诊断；各动作复杂度和时长不同，不能跨组平均。 |
@@ -262,7 +401,7 @@ ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap �
 - **缺少逐动作标签。**除 Static 可识别名义阶段外，动态录制没有逐动作标签；Dynamic、Combination、Body 的全段统计无法定位到具体动作、转场或异常来源。
 - **重采样会隐藏接收问题。**同步配对数据重采样至 50 Hz 后呈固定 20 ms 间隔，但这不会消除原始 Gap；必须同时保留原始接收率、P95/最大间隔和超过 30 ms 的比例。
 - **Replay 可追溯性有限。**固定 report 记录了来源、样本、控制率、substeps 与 live reference，但未记录完整代码提交、转换链、控制器、策略权重和 MuJoCo 模型哈希；未来软件或模型变化后不能仅凭路径保证逐位复现。
-- **29 DoF 被零通道稀释。**ELF3 `joint_pos[29]` 只有六个 wrist 通道承载设备差异，其余 23 个通道为零；整体 RMSE 会压低腕部差异，必须与六通道结果并列解释。
+- **29 DoF 被零通道稀释。**四组同步配对 metrics 的 ELF3 `joint_pos[29]` 只有六个 wrist 通道承载设备差异，其余 23 个通道为零；整体 RMSE 会压低腕部差异，必须与带标签六通道结果并列解释。Static 冻结跨 Trial artifact 只保留每阶段 29 DoF overall，未保留六通道或精确阶段切片，需重新生成分阶段分析后才能补齐。
 - **四元数统计受实现定义约束。**root orientation 等统计依赖现有实现对四元数归一化、双覆盖符号与相对旋转角的处理；当前没有独立实现的交叉校验，复现时必须保持同一定义，不能直接与采用不同聚合方式的结果混用。
 - **stability/contact 语义有限。**Canonical stability 是人体参考低运动窗口，不是跌倒判定；Replay 的 `fell` 才是阈值事件。`contact_count` 是任意接触的仿真子步累计，`self_collision_count` 是接触事件累计而非唯一碰撞数，且二者受时长和 substeps 影响，不能跨时长直接排名。
 - **部署证据缺失。**五组数据没有佩戴、遮挡、传感器数量、搭建时间与环境适应性的量化对照，不能从现有数字推导部署优劣。
