@@ -2,7 +2,17 @@
 
 ## 执行摘要
 
-本报告汇集 Static、Single-joint、Dynamic、Combination 和 Body 五组既有录制及离线评估产物，比较 PICO 与 ZeroLab 的人体参考一致性、时序质量、动态平滑性和 ELF3 MuJoCo Replay 表现。本阶段建立可复现的章节、比较口径和证据索引；执行摘要的定量发现与设备选择结论在逐组证据完成分析后写入。
+本报告汇集 Static、Single-joint、Dynamic、Combination 和 Body 五组既有录制及离线评估产物，比较 PICO 与 ZeroLab 的人体参考一致性、时序质量、动态平滑性和 ELF3 MuJoCo Replay 表现。结论按场景和维度给出，不跨动作平均，也不设置设备总分。
+
+- **接收质量按场景分化。**Single-joint 中 ZeroLab 的平均接收率和原始 Gap 占比优于 PICO（49.183 Hz、7.00% 对 48.589 Hz、11.98%），但在 Combination/Body 中降至 37.337/35.700 Hz，Gap 占比升至 29.491%/37.55%。
+- **Static 只支持名义姿态复现判断。**PICO013 与 ZeroLab014 是非同步跨 Trial；T、N_after_T、A 的 pose RMSE 分别为 13.731°、30.582°、23.754°，不能解释为逐帧误差或绝对精度。
+- **肩腕映射是共同改进点。**Single-joint 的右肩 RMSE 达 63.426°；六个 wrist 通道承载全部 ELF3 设备间差异，29 DoF 整体值受 23 个零通道稀释。
+- **PICO 在已报告的多组 canonical 平滑性上更有优势。**Static 三阶段与 Single-joint 的 PICO 姿态加速度、jerk 均较低，Dynamic 也呈相同方向；该优势不等价于人体姿态更准确。
+- **Replay 易跟踪性没有单一赢家。**ZeroLab 在 Single-joint 和 Combination 的 tracking RMSE 较低；PICO 在 60 帧临时诊断 Body 中较低（0.11847 对 0.13629 rad）。
+- **Replay 安全事件也需分场景看。**ZeroLab 五组均未触发跌倒；PICO Dynamic 在 sample 6157 因 61.282° 倾角越阈值触发 `fell=true`，但最低基座高度仍为 0.813 m，不能表述为机器人倒地。
+- **限位结果需逐场景验收。**Single-joint 中 PICO/ZeroLab 为 23/0 个限位样本，Body 中 ZeroLab 有 8 个，Static 双方均为 0；不能据此形成跨动作安全排名。
+- **复杂动作暴露高动态差异。**Dynamic、Combination、Body 的 pose angular velocity RMSE 分别为 372.359、637.417、380.618°/s，且 Combination 存在接近 180° 的单点 pose 异常。
+- **工程选择应先匹配任务。**稳定接收与平滑输入优先评估 PICO；Single-joint/Combination 的机器人易跟踪性可优先评估 ZeroLab；正式选型仍需同步动作标签、完整哈希和外部 ground truth 补证。
 
 ## 1. 评估目标与结论边界
 
@@ -50,7 +60,7 @@ Dynamic、Combination 与 Body 也均只在各自同步配对的公共 canonical
 
 ## 5. Static：PICO013 与 ZeroLab014 跨 Trial 对照
 
-PICO013 与 ZeroLab014 不是同步录制。故本节只把可识别的相同名义稳定动作配对：T-pose（T）、T-pose 后自然站立（N_after_T）和 A-pose（A）；PICO 的全段还包含同步开场和正式 T/N/A/N，ZeroLab 则是从 formal onset 开始的 formal T/N/A/direct-T/N。PICO 不含最后的 T/N，ZeroLab 也不含计划中的 A 后自然站立，因此这些末尾片段不进入统计。本组证据强度低于第 6--9 节同步配对实验，**不报告或解释跨设备接收延迟、互相关、时间对齐，或逐帧动态误差**。
+PICO013 与 ZeroLab014 不是同步录制。故本节只把可识别的相同名义稳定动作配对：T-pose（T）、T-pose 后自然站立（N_after_T）和 A-pose（A）；PICO 的全段还包含同步开场和正式 T/N/A/N，ZeroLab 则是从 formal onset 开始的 formal T/N/A/direct-T/N。ZeroLab 末尾的 direct-T/N 因 PICO 无对应动作而排除；ZeroLab 也不含计划中的 A 后自然站立，因此这些末尾片段不进入统计。本组证据强度低于第 6--9 节同步配对实验，**不报告或解释跨设备接收延迟、互相关、时间对齐，或逐帧动态误差**。
 
 ### 5.1 名义姿态 agreement
 
@@ -211,17 +221,59 @@ ZeroLab 的原始平均接收率为 **37.337 Hz**，超过 30 ms 的原始 Gap �
 
 本节仅从五组中重复出现且可由固定证据追溯的现象归纳 PICO 的优点、局限与适用条件；不以单一指标替代其他维度，也不作绝对准确度声明。
 
+- **数据接收。**优点是当 ZeroLab 在 Combination/Body 分别只有 37.337/35.700 Hz、原始 Gap 占 29.491%/37.55% 时，PICO 更适合作为稳定接收优先场景的候选。缺点是这一方向并非所有动作都成立：Single-joint 的 PICO 接收率为 48.589 Hz、Gap 占 11.98%，均弱于 ZeroLab 的 49.183 Hz、7.00%。
+- **姿态。**Static 的 T 阶段设备间 pose RMSE 为 13.731°，低于 N_after_T 的 30.582°和 A 的 23.754°，说明 PICO 流与 ZeroLab 流在标准 T 名义姿态上更接近。缺点是该指标为双方 agreement，不能将较小差异单独归功于 PICO；Single-joint 的右肩 63.426° RMSE 和六个非零 wrist 差异通道也说明其输出仍需肩腕映射校核。
+- **动态平滑。**这是 PICO 最稳定的相对优势：Static 三阶段的 pose 加速度 RMS 为 ZeroLab 的约 1/3.4 至 1/10.5，jerk 为约 1/4.0 至 1/11.5；Single-joint 的姿态加速度/jerk 为 642.300/53,270.909，对方为 3,847.818/319,723.356，Dynamic 也呈 PICO 较低的方向。限制是平滑只描述高频变化，不证明动作幅值或真人姿态更正确。
+- **Replay。**优点是 60 帧临时诊断 Body 的 tracking RMSE 较低（0.11847 对 0.13629 rad），Single-joint 的最大误差也较低（1.3889 对 1.8996 rad）。缺点是 Single-joint 的 RMSE、P95、速度 RMSE 均高于 ZeroLab，Combination tracking RMSE 也略高（0.09144 对 0.08833 rad）。
+- **安全性。**Static 无限位、无跌倒，Body 未跌倒。缺点是 Single-joint 出现 23 个限位样本，而 ZeroLab 为 0；Dynamic 在 sample 6157 因最大倾角 61.282°触发 `fell=true`。该事件是阈值触发且最低基座高度仍为 0.813 m，不能扩大为真实倒地结论。
+- **部署条件。**现有证据仅覆盖固定离线产物和 live reference Replay，未量化佩戴、遮挡、传感器数量、搭建时间或现场维护成本，因此不能从本报告给 PICO 部署便利性排序；工程选型需另行实测这些条件。
+
 ## 11. ZeroLab 的优点与缺点
 
 本节仅从五组中重复出现且可由固定证据追溯的现象归纳 ZeroLab 的优点、局限与适用条件；较低 Replay tracking RMSE 只表示该段目标更易被机器人跟踪，不表示更接近真人动作。
 
+- **数据接收。**优点是 Single-joint 的平均接收率为 49.183 Hz，原始 Gap 占 7.00%，优于同组 PICO 的 48.589 Hz 和 11.98%。缺点是在 Combination/Body 中分别降至 37.337/35.700 Hz，超过 30 ms 的原始 Gap 升至 29.491%/37.55%，对依赖连续实时输入的任务构成直接限制。
+- **姿态。**Static 的 T/N_after_T/A pose agreement 为 13.731°/30.582°/23.754°，Single-joint 的位置 RMSE 为 0.0831 m；这些数值证明两条流仍有明显场景差异。缺点与 PICO 相同：右肩 63.426° RMSE、六个 wrist 通道非零差异和快速动作的高动态误差尚不能归因到单侧设备，必须通过外部真值或受控映射实验拆分来源。
+- **动态平滑。**当前主要缺点是已报告多组的高频变化更强：Static 三阶段 pose 加速度为 PICO 的约 3.4–10.5 倍、jerk 为约 4.0–11.5 倍；Single-joint 的姿态加速度和 jerk 均约为 PICO 的 6.0 倍，Dynamic 亦高于 PICO。平滑性较弱不等价于绝对姿态误差更大。
+- **Replay。**优点是 Single-joint 的 tracking RMSE/速度 RMSE 为 0.0644 rad/0.5746 rad/s，低于 PICO 的 0.0693/0.6973；Combination 的 0.08833 rad 也略低于 PICO 的 0.09144。缺点是 60 帧临时诊断 Body 的 RMSE 较高（0.13629 对 0.11847 rad），Static 的三个阶段也有胜有负，不能外推为普遍更易跟踪。
+- **安全性。**五组均未触发跌倒，Single-joint 为 0 个限位样本，Static 也无限位。缺点是 60 帧临时诊断 Body 有 8 个限位样本；此外，`fell`、限位、最大倾角和 tracking 误差是不同维度，不能因“未跌倒”就忽略其它风险信号。
+- **部署条件。**当前录制没有给出佩戴、遮挡、传感器数量、布置时间或环境适应性的量化对照，因此不对 ZeroLab 的部署门槛作数据外推；尤其不能用 Combination/Body 的接收抖动替代专门的遮挡或佩戴实验。
+
 ## 12. 综合性能分析与适用场景
 
-综合性能依据五种场景是否重复出现同方向差异形成：数据接收与时间稳定性、静态姿态与末端位置一致性、单关节映射可解释性、快速/组合动作平滑性、Sonic–MuJoCo 可执行性与安全性、部署便利性与传感器覆盖分别判断。不同动作难度的 RMSE 不直接平均；单组异常保留场景限定。
+综合性能依据五种场景中可重复或可明确限定的证据形成；不同动作难度的 RMSE 不直接平均，单组异常保留场景限定。
+
+| 场景 / 维度 | 建议 | 数据依据 | 适用限制 |
+|---|---|---|---|
+| 稳定采集和动态平滑 | 对连续实时输入、平滑目标优先的任务，先评估 PICO；若任务接近 Single-joint，也应实测 ZeroLab，因为该组接收更稳。 | ZeroLab 在 Combination/Body 为 37.337/35.700 Hz、Gap 占 29.491%/37.55%；PICO 在 Static 三阶段、Single-joint 和 Dynamic 的已报告平滑性均较好。Single-joint 则是 ZeroLab 49.183 Hz、7.00% 优于 PICO 48.589 Hz、11.98%。 | 未获得每组都完整展开的原始 timing 数字；平滑性不代表绝对精度，50 Hz 重采样结果也不能替代原始 Gap。 |
+| 静态名义姿态 | T-pose 复现可作为双方标定检查点；需要更平滑的稳定姿态输入时优先试 PICO，但不据此选择“更准确”的设备。 | Static T/N_after_T/A 的 pose RMSE 为 13.731°/30.582°/23.754°；三阶段 PICO 的 pose 加速度和 jerk 均低于 ZeroLab。 | PICO013/ZeroLab014 为非同步跨 Trial；只比较共同名义阶段，不能报告时序、逐帧误差或单侧绝对精度。 |
+| 单关节与末端 | 机器人跟踪和限位优先时，Single-joint 可先评估 ZeroLab；无论设备，先修正肩腕映射再作精度选型。 | ZeroLab/PICO tracking RMSE 为 0.0644/0.0693 rad、限位为 0/23；右肩 RMSE 63.426°，位置 RMSE 0.0831 m，六个 wrist 通道均有非零差异。 | tracking 是各自目标的可跟踪性；肩腕误差是设备间差异，现有证据不能定位到单侧硬件或算法。 |
+| 复杂动作 | 没有跨 Dynamic、Combination、Body 的统一赢家：输入平滑优先时评估 PICO；Dynamic 的跌倒阈值与 Combination 的易跟踪性优先时评估 ZeroLab；Body 临时配置下则先评估 PICO Replay。 | 三组动态姿态差异为 372.359/637.417/380.618°/s；ZeroLab Dynamic 未触发跌倒且 Combination RMSE 较低，PICO Body RMSE 较低，ZeroLab Body 有 8 个限位样本。 | Combination 有接近 180° 的单点异常；Body 仅为 60 帧临时诊断；各动作复杂度和时长不同，不能跨组平均。 |
+| 实时 Sonic 可执行性 | 两套设备均已在五组产物中完成 Replay，但上线前应按目标动作分别验收 tracking、限位、倾角和基座高度，不以单一安全标签放行。 | Static 双方无跌倒/限位；Single-joint 双方未跌倒但限位 23/0；Dynamic 仅 PICO 触发倾角阈值；Combination 双方未跌倒；Body 双方未跌倒且 ZeroLab 有 8 个限位样本。 | Replay tracking 不是动捕精度；`fell` 是阈值判据，contact 与 self-collision 是受时长/substeps 影响的累计量，且现有产物缺少完整代码/模型哈希。 |
+| 部署条件 | 暂不基于本五组数据推荐设备；应在目标现场另测佩戴、遮挡、传感器配置、布置时间和维护成本。 | 本报告数据源没有这些维度的量化对照。 | 不得用接收率、canonical 平滑性或 Replay 结果替代部署条件测试。 |
 
 ## 13. 局限与后续改进优先级
 
-本报告没有绝对真值，故不输出设备绝对精度结论。Static 的非同步跨 Trial 性质降低证据强度；Body 的 60 帧临时标定限制其可比范围；接触计数受时长和仿真子步数影响。后续改进以补足可比较的同步证据、明确低置信度数据、保持单位一致和逐项追溯关键数值为优先。
+### 13.1 证据与解释局限
+
+- **无绝对真值。**Agreement 只衡量两条转换流彼此的一致程度；没有光学动捕或其它外部 ground truth，无法把差异归因到某一设备，也不能输出绝对精度结论。Replay tracking 只衡量机器人跟踪各自 Sonic 目标的难度，不是动捕精度。
+- **Static 非同步。**PICO013 与 ZeroLab014 是**非同步跨 Trial**，只允许比较 T、N_after_T、A 的名义稳定阶段；ZeroLab 末尾 direct-T/N 因 PICO 无对应动作而排除。样本重复性、起始姿态和录制差异均可能进入结果，因此不得推导延迟、互相关或逐帧动态误差。
+- **Body 配置临时。**Body 使用 **60 帧**临时诊断标定，不能代表 100 帧正式标定的性能上限，亦不能把该组结果外推到其它动作。
+- **缺少逐动作标签。**除 Static 可识别名义阶段外，动态录制没有逐动作标签；Dynamic、Combination、Body 的全段统计无法定位到具体动作、转场或异常来源。
+- **重采样会隐藏接收问题。**同步配对数据重采样至 50 Hz 后呈固定 20 ms 间隔，但这不会消除原始 Gap；必须同时保留原始接收率、P95/最大间隔和超过 30 ms 的比例。
+- **Replay 可追溯性有限。**固定 report 记录了来源、样本、控制率、substeps 与 live reference，但未记录完整代码提交、转换链、控制器、策略权重和 MuJoCo 模型哈希；未来软件或模型变化后不能仅凭路径保证逐位复现。
+- **29 DoF 被零通道稀释。**ELF3 `joint_pos[29]` 只有六个 wrist 通道承载设备差异，其余 23 个通道为零；整体 RMSE 会压低腕部差异，必须与六通道结果并列解释。
+- **四元数统计受实现定义约束。**root orientation 等统计依赖现有实现对四元数归一化、双覆盖符号与相对旋转角的处理；当前没有独立实现的交叉校验，复现时必须保持同一定义，不能直接与采用不同聚合方式的结果混用。
+- **stability/contact 语义有限。**Canonical stability 是人体参考低运动窗口，不是跌倒判定；Replay 的 `fell` 才是阈值事件。`contact_count` 是任意接触的仿真子步累计，`self_collision_count` 是接触事件累计而非唯一碰撞数，且二者受时长和 substeps 影响，不能跨时长直接排名。
+- **部署证据缺失。**五组数据没有佩戴、遮挡、传感器数量、搭建时间与环境适应性的量化对照，不能从现有数字推导部署优劣。
+
+### 13.2 后续改进优先级
+
+1. **ZeroLab 接收抖动：**先定位 Combination/Body 中 37.337/35.700 Hz 与 29.491%/37.55% Gap 的采集、传输和时间戳来源，并保留修复前后同动作原始 timing。
+2. **肩腕映射：**用受控单关节动作拆分右肩 63.426°误差来源，并逐一校核六个 wrist 通道的坐标系、符号、零位和限幅。
+3. **动作标签：**为 Dynamic、Combination、Body 写入逐动作与转场标签，使异常、平滑性和 Replay 事件能回溯到动作片段。
+4. **可追溯哈希：**在 canonical、metrics 与 Replay report 中固化录制源、代码提交、转换配置、控制器、策略权重和 MuJoCo 模型哈希。
+5. **外部 ground truth：**使用同步光学动捕或等价测量建立绝对参考，并在相同 Trial、相同动作和相同标定配置下重新比较两套设备。
 
 ## 14. 数据源与复现路径
 
