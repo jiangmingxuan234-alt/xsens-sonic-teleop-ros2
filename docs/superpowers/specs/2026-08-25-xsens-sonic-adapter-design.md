@@ -2,7 +2,8 @@
 
 Date: 2026-08-25
 
-Status: Approved design baseline; pending written-spec review
+Status: Proposed written specification based on the approved interaction
+design; pending user review
 
 ## 1. Purpose
 
@@ -415,7 +416,10 @@ newest complete converted frame.
 - When more than one 60 Hz packet is available, all are validated and the
   rolling window advances through them; only the newest completed 10-frame
   chunk is published during that 50 Hz tick.
-- Normal 60-to-50 Hz frame skipping is expected and is not an error.
+- Because publication is 50 Hz, not every intermediate rolling-window state is
+  sent. Accepted 60 Hz source frames are still processed in counter order and
+  may advance the next published window; this publication decimation is not an
+  inferred UDP drop.
 - Publication requires ten strictly increasing converted frame indices.
 
 This matches the current SONIC behavior of using the newest complete reference
@@ -522,7 +526,7 @@ PD-brake, zero-torque, or recovery routes.
 ### 15.4 Stale or restarted source
 
 If the newest producer timestamp becomes older than 0.5 seconds, the source
-epoch changes, or the reference becomes invalid:
+epoch changes, or no valid reference remains through the freshness timeout:
 
 1. the live-reference gate is disabled;
 2. `xsens_live_enable=false` is sent;
@@ -540,6 +544,11 @@ The shared `SonicTeleopPolicy` gains a live-reference enable flag. It continues
 to receive and validate references while disabled so `sonic_xsens` can detect
 `READY`, but `_active_reference()` selects live data only when the flag is
 enabled.
+
+On every `sonic_xsens` control update, phase logic polls and validates source
+freshness and epoch before calling policy inference. A stale or new-epoch
+reference therefore disables the live gate before that reference can be used
+for a `LIVE` inference step.
 
 Existing PICO and ZeroLab states configure the flag enabled and retain their
 current automatic live-reference behavior. `sonic_xsens` configures manual
