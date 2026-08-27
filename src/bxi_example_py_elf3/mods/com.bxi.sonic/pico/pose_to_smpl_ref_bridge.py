@@ -18,11 +18,13 @@ latest frame.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
+import math
 import sys
 import time
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import zmq
@@ -31,6 +33,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float32
 
 from bxi_example_py_elf3.framework.mod_api import NodeBuildContext
+from xsens.source_core import XsensReason
 
 from .zmq_messages import pack_pose_message
 from .runtime_config import (
@@ -64,6 +67,7 @@ MAX_GAP_FRAMES = 200
 DEFAULT_RATE_HZ = 50.0
 POSE_STREAM_MODE = 1
 READY_CONSECUTIVE_MESSAGES = 3
+MAX_PRODUCER_AGE_NS = 500_000_000
 
 
 PICO_BUTTON_FIELDS = (
@@ -76,15 +80,24 @@ PICO_BUTTON_FIELDS = (
 BRIDGE_DEFAULTS: dict[str, object] = {
     "pico_host": PICO_HOST,
     "pico_port": PICO_PORT,
-    "pico_topic": PICO_TOPIC,
     "out_host": SMPL_REF_HOST,
     "out_port": SMPL_REF_PORT,
-    "out_topic": SMPL_REF_TOPIC,
+    "source_kind": "legacy",
+    "input_pose_topic": PICO_TOPIC,
+    "input_status_topic": "xsens_status",
+    "output_reference_topic": SMPL_REF_TOPIC,
+    "output_status_topic": "xsens_status",
+    "authoritative_input_window": False,
+    "readiness_debounce_messages": 3,
     "rate_hz": DEFAULT_RATE_HZ,
     "history_frames": HISTORY_FRAMES,
     "max_gap_frames": MAX_GAP_FRAMES,
     "catch_up_enabled": True,
     "stale_warning_seconds": PICO_STALE_SECONDS,
+}
+BRIDGE_ALIASES = {
+    "pico_topic": "input_pose_topic",
+    "out_topic": "output_reference_topic",
 }
 
 
@@ -227,6 +240,254 @@ def _decode_packed_message(msg: bytes, topic: str) -> dict[str, np.ndarray] | No
         out[name] = arr.reshape(shape).copy()
         offset += nbytes
     return out
+
+
+class PackedMessageInput(Protocol):
+    def drain(self) -> tuple[bytes, ...]:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class PackedTopicOutput(Protocol):
+    def send(self, topic: str, fields: Mapping[str, np.ndarray]) -> bool:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class ZmqPackedMessageInput:
+    """One ordered packed-topic input connection owned by the bridge."""
+
+    def __init__(self, host: str, port: int, topics) -> None:
+        self._closed = False
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.SUB)
+        try:
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.setsockopt(zmq.RCVHWM, 64)
+            for topic in topics:
+                self._socket.setsockopt_string(zmq.SUBSCRIBE, topic)
+            self._socket.connect(f"tcp://{host}:{port}")
+        except Exception:
+            self._socket.close(linger=0)
+            self._context.term()
+            self._closed = True
+            raise
+
+    def drain(self) -> tuple[bytes, ...]:
+        messages = []
+        while True:
+            try:
+                messages.append(self._socket.recv(flags=zmq.NOBLOCK))
+            except zmq.Again:
+                return tuple(messages)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._socket.close(linger=0)
+        self._context.term()
+
+
+class ZmqPackedTopicOutput:
+    """One packed-topic output connection shared by status and reference."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._closed = False
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.PUB)
+        try:
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.setsockopt(zmq.SNDHWM, 64)
+            self._socket.bind(f"tcp://{host}:{port}")
+        except Exception:
+            self._socket.close(linger=0)
+            self._context.term()
+            self._closed = True
+            raise
+
+    def send(self, topic: str, fields: Mapping[str, np.ndarray]) -> bool:
+        message = pack_pose_message(fields, topic=topic, version=4)
+        try:
+            self._socket.send(message, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return False
+        return True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._socket.close(linger=0)
+        self._context.term()
+
+
+_XSENS_POSE_SCHEMA = {
+    "frame_index": (np.dtype(np.int64), (10,)),
+    "smpl_joints": (np.dtype(np.float32), (10, 24, 3)),
+    "body_quat_w": (np.dtype(np.float32), (10, 4)),
+    "joint_pos": (np.dtype(np.float32), (10, 29)),
+    "stream_mode": (np.dtype(np.int32), (1,)),
+    "calibration_ready": (np.dtype(np.bool_), (1,)),
+    "producer_monotonic_ns": (np.dtype(np.int64), (1,)),
+    "source_epoch": (np.dtype(np.int64), (1,)),
+}
+_XSENS_STATUS_SCHEMA = {
+    "status_sequence": (np.dtype(np.int64), (1,)),
+    "status_monotonic_ns": (np.dtype(np.int64), (1,)),
+    "source_epoch": (np.dtype(np.int64), (1,)),
+    "last_arm_command_id": (np.dtype(np.int64), (1,)),
+    "last_arm_target_epoch": (np.dtype(np.int64), (1,)),
+    "last_requested_arm_epoch": (np.dtype(np.int64), (1,)),
+    "accepted_arm_epoch": (np.dtype(np.int64), (1,)),
+    "producer_monotonic_ns": (np.dtype(np.int64), (1,)),
+    "newest_frame_index": (np.dtype(np.int64), (1,)),
+    "ready": (np.dtype(np.bool_), (1,)),
+    "reference_window_ready": (np.dtype(np.bool_), (1,)),
+    "source_stale": (np.dtype(np.bool_), (1,)),
+    "ready_frames": (np.dtype(np.int32), (1,)),
+    "recovery_frames": (np.dtype(np.int32), (1,)),
+    "reason_code": (np.dtype(np.int32), (1,)),
+}
+
+
+def _validate_array_schema(
+    fields: Mapping[str, np.ndarray],
+    schema: Mapping[str, tuple[np.dtype, tuple[int, ...]]],
+) -> None:
+    missing = sorted(set(schema) - set(fields))
+    if missing:
+        raise ValueError(f"missing field {missing[0]}")
+    unexpected = sorted(set(fields) - set(schema))
+    if unexpected:
+        raise ValueError(f"unexpected field {unexpected[0]}")
+    for name, (dtype, shape) in schema.items():
+        value = fields[name]
+        if not isinstance(value, np.ndarray):
+            raise ValueError(f"{name} must be an np.ndarray")
+        if value.dtype != dtype:
+            raise ValueError(f"{name} has dtype {value.dtype}; expected {dtype}")
+        if value.shape != shape:
+            raise ValueError(f"{name} has shape {value.shape}; expected {shape}")
+
+
+def _build_authoritative_xsens_smpl_ref(
+    fields: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    _validate_array_schema(fields, _XSENS_POSE_SCHEMA)
+    for name in ("smpl_joints", "body_quat_w", "joint_pos"):
+        if not np.isfinite(fields[name]).all():
+            raise ValueError(f"{name} must contain only finite values")
+    if np.any(np.linalg.norm(fields["body_quat_w"], axis=1) <= 0):
+        raise ValueError("body_quat_w must contain nonzero root quaternions")
+    if int(fields["stream_mode"][0]) != POSE_STREAM_MODE:
+        raise ValueError("stream_mode must be 1")
+    if int(fields["producer_monotonic_ns"][0]) <= 0:
+        raise ValueError("producer_monotonic_ns must be positive")
+    if int(fields["source_epoch"][0]) <= 0:
+        raise ValueError("source_epoch must be positive")
+    if np.any(np.diff(fields["frame_index"]) <= 0):
+        raise ValueError("frame_index must be strictly increasing")
+
+    return {
+        "term1_local": np.ascontiguousarray(
+            fields["smpl_joints"].reshape(10, 72), dtype=np.float32
+        ),
+        "root_quat": np.ascontiguousarray(
+            fields["body_quat_w"], dtype=np.float32
+        ),
+        "wrist": np.ascontiguousarray(
+            fields["joint_pos"][:, ELF3_NATIVE_WRIST_IDX], dtype=np.float32
+        ),
+        "frame_index": np.array([fields["frame_index"][0]], dtype=np.int64),
+        "source_ready": np.array(
+            [fields["calibration_ready"][0]], dtype=np.bool_
+        ),
+        "producer_monotonic_ns": np.array(
+            fields["producer_monotonic_ns"], copy=True
+        ),
+        "source_epoch": np.array(fields["source_epoch"], copy=True),
+        "source_newest_frame_index": np.array(
+            [fields["frame_index"][9]], dtype=np.int64
+        ),
+    }
+
+
+def _validate_xsens_status_fields(
+    fields: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    _validate_array_schema(fields, _XSENS_STATUS_SCHEMA)
+    values = {name: value[0].item() for name, value in fields.items()}
+
+    if values["status_sequence"] < 1:
+        raise ValueError("status_sequence must be positive")
+    if values["status_monotonic_ns"] < 0:
+        raise ValueError("status_monotonic_ns must be nonnegative")
+    for name in (
+        "source_epoch",
+        "last_arm_command_id",
+        "last_arm_target_epoch",
+        "last_requested_arm_epoch",
+        "accepted_arm_epoch",
+        "producer_monotonic_ns",
+    ):
+        if values[name] < 0:
+            raise ValueError(f"{name} must be nonnegative")
+    if values["newest_frame_index"] < -1:
+        raise ValueError("newest_frame_index must be at least -1")
+
+    command_id = values["last_arm_command_id"]
+    target_epoch = values["last_arm_target_epoch"]
+    requested_epoch = values["last_requested_arm_epoch"]
+    if command_id == 0:
+        if target_epoch != 0 or requested_epoch != 0:
+            raise ValueError("arm target/request requires a command receipt")
+    elif target_epoch <= 0 or requested_epoch not in (0, target_epoch):
+        raise ValueError("arm receipt target/request relationship is invalid")
+
+    accepted_epoch = values["accepted_arm_epoch"]
+    source_epoch = values["source_epoch"]
+    if accepted_epoch not in (0, source_epoch):
+        raise ValueError("accepted_arm_epoch must equal source_epoch")
+    if accepted_epoch > 0 and (source_epoch <= 0 or command_id <= 0):
+        raise ValueError("accepted_arm_epoch requires a positive receipt")
+
+    producer_ns = values["producer_monotonic_ns"]
+    newest_frame = values["newest_frame_index"]
+    no_data = producer_ns == 0 and newest_frame == -1
+    if (producer_ns == 0) != (newest_frame == -1):
+        raise ValueError("producer_monotonic_ns/newest_frame_index sentinel mismatch")
+    if no_data:
+        if (
+            source_epoch != 0
+            or values["ready"]
+            or values["reference_window_ready"]
+        ):
+            raise ValueError("no-data status has invalid epoch or readiness")
+    elif producer_ns <= 0 or newest_frame < 0 or source_epoch <= 0:
+        raise ValueError("data-present status requires positive source metadata")
+
+    if values["source_stale"] and (
+        values["ready"] or values["reference_window_ready"]
+    ):
+        raise ValueError("source_stale requires readiness to be false")
+    if values["ready"] and not values["reference_window_ready"]:
+        raise ValueError("ready requires reference_window_ready")
+    if (values["ready"] or values["reference_window_ready"]) and no_data:
+        raise ValueError("readiness requires data-present status")
+    if not 0 <= values["ready_frames"] <= 30:
+        raise ValueError("ready_frames must be in 0..30")
+    if not 0 <= values["recovery_frames"] <= 10:
+        raise ValueError("recovery_frames must be in 0..10")
+    valid_reasons = {int(reason) for reason in XsensReason}
+    if values["reason_code"] not in valid_reasons:
+        raise ValueError("reason_code is not an XsensReason")
+
+    return {name: np.array(value, copy=True) for name, value in fields.items()}
 
 
 def _as_frame_matrix(arr: np.ndarray, width: int, name: str) -> np.ndarray:
@@ -488,14 +749,39 @@ def _build_live_smpl_ref_if_ready(
     return smpl_ref
 
 
-def _validated_params(raw: dict[str, object]) -> dict[str, object]:
-    unknown = set(raw) - set(BRIDGE_DEFAULTS)
+def _validated_bridge_params(
+    raw: Mapping[str, object],
+) -> dict[str, object]:
+    normalized = dict(raw)
+    allowed = set(BRIDGE_DEFAULTS) | set(BRIDGE_ALIASES)
+    unknown = set(normalized) - allowed
     if unknown:
-        raise ValueError(f"unknown SONIC bridge params: {sorted(unknown)}")
+        raise ValueError(f"unknown bridge params: {sorted(unknown)}")
+
+    for alias, canonical in BRIDGE_ALIASES.items():
+        if alias not in normalized:
+            continue
+        if canonical in normalized and normalized[alias] != normalized[canonical]:
+            raise ValueError(
+                f"conflicting bridge params: {alias} and {canonical}"
+            )
+        normalized.setdefault(canonical, normalized[alias])
+        del normalized[alias]
+
     params = {
-        name: raw.get(name, default) for name, default in BRIDGE_DEFAULTS.items()
+        name: normalized.get(name, default)
+        for name, default in BRIDGE_DEFAULTS.items()
     }
-    for name in ("pico_host", "pico_topic", "out_host", "out_topic"):
+    if params["source_kind"] not in ("legacy", "xsens"):
+        raise ValueError("source_kind must be exactly 'legacy' or 'xsens'")
+    for name in (
+        "pico_host",
+        "out_host",
+        "input_pose_topic",
+        "input_status_topic",
+        "output_reference_topic",
+        "output_status_topic",
+    ):
         if not isinstance(params[name], str) or not params[name]:
             raise ValueError(f"{name} must be a non-empty string")
     for name in ("pico_port", "out_port"):
@@ -515,68 +801,127 @@ def _validated_params(raw: dict[str, object]) -> dict[str, object]:
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
+            or not math.isfinite(value)
             or value <= 0
         ):
             raise ValueError(f"{name} must be greater than zero")
-    if not isinstance(params["catch_up_enabled"], bool):
-        raise ValueError("catch_up_enabled must be a boolean")
+    for name in ("catch_up_enabled", "authoritative_input_window"):
+        if type(params[name]) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+    debounce = params["readiness_debounce_messages"]
+    if isinstance(debounce, bool) or not isinstance(debounce, int) or debounce < 1:
+        raise ValueError("readiness_debounce_messages must be a positive integer")
+    if params["source_kind"] == "xsens" and (
+        params["authoritative_input_window"] is not True or debounce != 1
+    ):
+        raise ValueError(
+            "xsens requires authoritative_input_window=true and "
+            "readiness_debounce_messages=1"
+        )
     return params
+
+
+def _validated_params(raw: Mapping[str, object]) -> dict[str, object]:
+    return _validated_bridge_params(raw)
 
 
 class SmplRefBridgeNode(Node):
     """Non-blocking ROS node owned by the framework's shared executor."""
 
-    def __init__(self, context: NodeBuildContext):
-        params = _validated_params(dict(context.params))
+    def __init__(
+        self,
+        context: NodeBuildContext,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        input_transport: PackedMessageInput | None = None,
+        output_transport: PackedTopicOutput | None = None,
+    ):
+        params = _validated_bridge_params(dict(context.params))
         super().__init__(context.node_name, namespace=context.namespace or None)
 
-        self._pico_topic = str(params["pico_topic"])
-        self._out_topic = str(params["out_topic"])
+        self._monotonic = monotonic
+        self._monotonic_ns = monotonic_ns
+        self._source_kind = str(params["source_kind"])
+        self._input_pose_topic = str(params["input_pose_topic"])
+        self._input_status_topic = str(params["input_status_topic"])
+        self._output_reference_topic = str(params["output_reference_topic"])
+        self._output_status_topic = str(params["output_status_topic"])
+        self._pico_topic = self._input_pose_topic
+        self._out_topic = self._output_reference_topic
         self._stale_seconds = float(params["stale_warning_seconds"])
         self._merger = StreamedSmplRefMerger(
             history_frames=int(params["history_frames"]),
             max_gap_frames=int(params["max_gap_frames"]),
             catch_up_enabled=bool(params["catch_up_enabled"]),
         )
-        self._source_gate = PicoSourceReadinessGate()
-        self._button_publishers = {
-            name: self.create_publisher(Float32, f"pico/{name}", 10)
-            for name in PICO_BUTTON_FIELDS
-        }
+        self._source_gate = PicoSourceReadinessGate(
+            required_consecutive=int(params["readiness_debounce_messages"])
+        )
+        self._button_publishers = {}
         self._invalid_button_fields: set[str] = set()
         self._pending_fields: dict[str, np.ndarray] | None = None
+        self._pending_xsens_pose: dict[str, np.ndarray] | None = None
+        self._pending_status: dict[str, np.ndarray] | None = None
+        self._last_forwarded_status_epoch: int | None = None
+        self._last_forwarded_status_frame: int = -1
+        self._last_forwarded_status_sequence: int = 0
+        self._last_xsens_epoch_seen: int | None = None
+        self._last_xsens_status_sequence_seen: int = 0
+        self._last_xsens_pose_epoch: int | None = None
+        self._last_xsens_pose_newest_seen: int = -1
+        self._status_send_failed_this_tick: bool = False
         self._last_received_mono: float | None = None
         self._received = 0
         self._skipped = 0
         self._stale_was_reported = False
         self._stream_state: str | None = None
         self._closed = False
-
-        self._zmq_context = zmq.Context()
-        self._sub = self._zmq_context.socket(zmq.SUB)
-        self._sub.setsockopt(zmq.LINGER, 0)
-        self._sub.setsockopt(zmq.RCVHWM, 1)
-        self._sub.setsockopt_string(zmq.SUBSCRIBE, self._pico_topic)
+        self._destroy_result = None
+        self._timer = None
+        self._input_transport: PackedMessageInput | None = None
+        self._output_transport: PackedTopicOutput | None = None
+        self._owns_input_transport = False
+        self._owns_output_transport = False
         self._pico_endpoint = f"tcp://{params['pico_host']}:{params['pico_port']}"
-        self._sub.connect(self._pico_endpoint)
-
-        self._pub = self._zmq_context.socket(zmq.PUB)
-        self._pub.setsockopt(zmq.LINGER, 0)
-        self._pub.setsockopt(zmq.SNDHWM, 2)
         self._out_endpoint = f"tcp://{params['out_host']}:{params['out_port']}"
+
         try:
-            self._pub.bind(self._out_endpoint)
+            if input_transport is None:
+                topics = (
+                    (self._input_pose_topic, self._input_status_topic)
+                    if self._source_kind == "xsens"
+                    else (self._input_pose_topic,)
+                )
+                self._input_transport = ZmqPackedMessageInput(
+                    str(params["pico_host"]), int(params["pico_port"]), topics
+                )
+                self._owns_input_transport = True
+            else:
+                self._input_transport = input_transport
+
+            if output_transport is None:
+                self._output_transport = ZmqPackedTopicOutput(
+                    str(params["out_host"]), int(params["out_port"])
+                )
+                self._owns_output_transport = True
+            else:
+                self._output_transport = output_transport
+
+            for name in PICO_BUTTON_FIELDS:
+                self._button_publishers[name] = self.create_publisher(
+                    Float32, f"pico/{name}", 10
+                )
             self._timer = self.create_timer(1.0 / float(params["rate_hz"]), self._tick)
         except Exception:
-            self._sub.close(linger=0)
-            self._pub.close(linger=0)
-            self._zmq_context.term()
-            super().destroy_node()
+            self.destroy_node()
             raise
 
         self.get_logger().info(
-            f"SONIC bridge SUB {self._pico_endpoint} topic='{self._pico_topic}', "
-            f"PUB {self._out_endpoint} topic='{self._out_topic}', "
+            f"SONIC bridge SUB {self._pico_endpoint} "
+            f"topic='{self._input_pose_topic}', "
+            f"PUB {self._out_endpoint} topic='{self._output_reference_topic}', "
+            f"source_kind='{self._source_kind}', "
             f"rate={float(params['rate_hz']):g}Hz"
         )
 
@@ -597,68 +942,161 @@ class SmplRefBridgeNode(Node):
             message.data = value
             publisher.publish(message)
 
-    def _drain_input(self) -> None:
-        while True:
-            try:
-                message = self._sub.recv(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                return
-            try:
-                fields = _decode_packed_message(message, self._pico_topic)
-            except (KeyError, TypeError, ValueError) as exc:
-                self._skipped += 1
-                self.get_logger().warning(f"skipped malformed PICO packet: {exc}")
-                continue
-            if fields is None:
-                continue
-            self._publish_buttons(fields)
-            received_mono = time.monotonic()
-            self._pending_fields = (
-                fields
-                if self._source_gate.observe(
-                    fields,
-                    received_mono,
-                    self._stale_seconds,
-                )
-                else None
-            )
-            self._last_received_mono = received_mono
-            self._stale_was_reported = False
-            self._received += 1
+    def _invalidate_forwarded_barrier(self) -> None:
+        self._last_forwarded_status_epoch = None
+        self._last_forwarded_status_frame = -1
 
-    def _tick(self) -> None:
-        if self._closed:
+    def _record_forwarded_status(
+        self, fields: Mapping[str, np.ndarray]
+    ) -> None:
+        self._last_forwarded_status_sequence = int(fields["status_sequence"][0])
+        if bool(fields["source_stale"][0]):
+            self._invalidate_forwarded_barrier()
             return
-        self._drain_input()
-        now = time.monotonic()
-        if self._pending_fields is not None and self._source_gate.is_fresh(
-            now, self._stale_seconds
+        self._last_forwarded_status_epoch = int(fields["source_epoch"][0])
+        self._last_forwarded_status_frame = int(fields["newest_frame_index"][0])
+
+    def _handle_xsens_status(self, fields: dict[str, np.ndarray]) -> None:
+        epoch = int(fields["source_epoch"][0])
+        sequence = int(fields["status_sequence"][0])
+        stale = bool(fields["source_stale"][0])
+
+        if epoch != self._last_xsens_epoch_seen:
+            self._last_xsens_epoch_seen = epoch
+            self._last_xsens_status_sequence_seen = 0
+            if (
+                self._pending_status is not None
+                and int(self._pending_status["source_epoch"][0]) != epoch
+            ):
+                self._pending_status = None
+            self._invalidate_forwarded_barrier()
+            self._last_forwarded_status_sequence = 0
+            if (
+                self._pending_xsens_pose is not None
+                and int(self._pending_xsens_pose["source_epoch"][0]) != epoch
+            ):
+                self._pending_xsens_pose = None
+            if self._last_xsens_pose_epoch != epoch:
+                self._last_xsens_pose_epoch = None
+                self._last_xsens_pose_newest_seen = -1
+
+        if stale:
+            self._pending_xsens_pose = None
+            self._invalidate_forwarded_barrier()
+
+        if sequence <= self._last_xsens_status_sequence_seen:
+            return
+        self._last_xsens_status_sequence_seen = sequence
+        self._pending_status = {
+            name: np.array(value, copy=True) for name, value in fields.items()
+        }
+        assert self._output_transport is not None
+        if not self._output_transport.send(
+            self._output_status_topic, self._pending_status
         ):
+            self._status_send_failed_this_tick = True
+            return
+        forwarded = self._pending_status
+        self._pending_status = None
+        self._record_forwarded_status(forwarded)
+
+    def _handle_xsens_pose(
+        self, fields: dict[str, np.ndarray], now_ns: int
+    ) -> None:
+        reference = _build_authoritative_xsens_smpl_ref(fields)
+        epoch = int(reference["source_epoch"][0])
+        newest = int(reference["source_newest_frame_index"][0])
+        producer_ns = int(reference["producer_monotonic_ns"][0])
+        if self._last_xsens_epoch_seen is not None and (
+            epoch != self._last_xsens_epoch_seen
+        ):
+            return
+        if now_ns - producer_ns > MAX_PRODUCER_AGE_NS:
+            return
+        if epoch != self._last_xsens_pose_epoch:
+            self._last_xsens_pose_epoch = epoch
+            self._last_xsens_pose_newest_seen = -1
+        if newest <= self._last_xsens_pose_newest_seen:
+            return
+        self._last_xsens_pose_newest_seen = newest
+        self._pending_xsens_pose = reference
+
+    def _handle_legacy_pose(
+        self, fields: dict[str, np.ndarray], now_mono: float
+    ) -> None:
+        self._publish_buttons(fields)
+        self._pending_fields = (
+            fields
+            if self._source_gate.observe(
+                fields,
+                now_mono,
+                self._stale_seconds,
+            )
+            else None
+        )
+        self._last_received_mono = now_mono
+        self._stale_was_reported = False
+        self._received += 1
+
+    def _drain_input(self, now_mono: float, now_ns: int) -> None:
+        assert self._input_transport is not None
+        pose_marker = self._input_pose_topic.encode("utf-8") + b"{"
+        status_marker = self._input_status_topic.encode("utf-8") + b"{"
+        for message in self._input_transport.drain():
+            topic = None
+            message_kind = None
+            if self._source_kind == "xsens" and message.startswith(status_marker):
+                topic = self._input_status_topic
+                message_kind = "status"
+            elif message.startswith(pose_marker):
+                topic = self._input_pose_topic
+                message_kind = "pose"
+            if topic is None:
+                continue
+            try:
+                fields = _decode_packed_message(message, topic)
+                if fields is None:
+                    raise ValueError(f"invalid packed {topic} message")
+                if self._source_kind == "xsens":
+                    if message_kind == "status":
+                        self._handle_xsens_status(
+                            _validate_xsens_status_fields(fields)
+                        )
+                    else:
+                        self._handle_xsens_pose(fields, now_ns)
+                else:
+                    self._handle_legacy_pose(fields, now_mono)
+            except (KeyError, TypeError, ValueError, IndexError) as exc:
+                self._skipped += 1
+                self.get_logger().warning(f"skipped malformed bridge packet: {exc}")
+                continue
+
+    def _tick_legacy(self, now_mono: float) -> None:
+        if self._pending_fields is not None:
             try:
                 self._merger.merge(_parse_incoming_chunk(self._pending_fields))
             except (KeyError, TypeError, ValueError, IndexError) as exc:
                 self._skipped += 1
                 self._source_gate.reset()
+                self._merger.reset()
                 self.get_logger().warning(f"skipped invalid PICO pose: {exc}")
             self._pending_fields = None
 
         smpl_ref = _build_live_smpl_ref_if_ready(
             self._source_gate,
             self._merger,
-            now,
+            now_mono,
             self._stale_seconds,
         )
         if smpl_ref is not None:
-            try:
-                self._pub.send(
-                    pack_pose_message(smpl_ref, topic=self._out_topic, version=4),
-                    flags=zmq.NOBLOCK,
-                )
-            except zmq.Again:
+            assert self._output_transport is not None
+            if not self._output_transport.send(
+                self._output_reference_topic, smpl_ref
+            ):
                 self._skipped += 1
 
         input_age = (
-            now - self._last_received_mono
+            now_mono - self._last_received_mono
             if self._last_received_mono is not None
             else float("inf")
         )
@@ -694,21 +1132,82 @@ class SmplRefBridgeNode(Node):
                 f"input_age_ms={input_age * 1000.0:.0f}"
             )
 
+    def _tick(self) -> None:
+        if self._closed:
+            return
+        now_mono = self._monotonic()
+        now_ns = self._monotonic_ns()
+        self._status_send_failed_this_tick = False
+        self._drain_input(now_mono, now_ns)
+        if self._status_send_failed_this_tick:
+            return
+
+        if self._pending_status is not None:
+            pending = self._pending_status
+            assert self._output_transport is not None
+            if not self._output_transport.send(self._output_status_topic, pending):
+                return
+            self._pending_status = None
+            self._record_forwarded_status(pending)
+
+        if self._source_kind == "legacy":
+            self._tick_legacy(now_mono)
+            return
+
+        pose = self._pending_xsens_pose
+        if pose is None:
+            return
+        producer_ns = int(pose["producer_monotonic_ns"][0])
+        if now_ns - producer_ns > MAX_PRODUCER_AGE_NS:
+            self._pending_xsens_pose = None
+            return
+        if self._pending_status is not None:
+            return
+        epoch = int(pose["source_epoch"][0])
+        newest = int(pose["source_newest_frame_index"][0])
+        if (
+            self._last_forwarded_status_epoch != epoch
+            or self._last_forwarded_status_frame < newest
+        ):
+            return
+        assert self._output_transport is not None
+        if self._output_transport.send(self._output_reference_topic, pose):
+            self._pending_xsens_pose = None
+        else:
+            self._skipped += 1
+
     def destroy_node(self):
-        if not self._closed:
-            self._closed = True
-            if hasattr(self, "_timer"):
-                self.destroy_timer(self._timer)
-            for name, close_resource in (
-                ("PICO subscriber", lambda: self._sub.close(linger=0)),
-                ("smpl_ref publisher", lambda: self._pub.close(linger=0)),
-                ("ZMQ context", self._zmq_context.term),
-            ):
-                try:
-                    close_resource()
-                except Exception as exc:
-                    self.get_logger().warning(f"failed to close {name}: {exc}")
-        return super().destroy_node()
+        if self._closed:
+            return self._destroy_result
+        self._closed = True
+        if self._timer is not None:
+            timer, self._timer = self._timer, None
+            try:
+                self.destroy_timer(timer)
+            except Exception as exc:
+                self.get_logger().warning(f"failed to destroy timer: {exc}")
+        for name, publisher in reversed(tuple(self._button_publishers.items())):
+            try:
+                self.destroy_publisher(publisher)
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"failed to destroy pico/{name} publisher: {exc}"
+                )
+        self._button_publishers.clear()
+        if self._owns_output_transport and self._output_transport is not None:
+            output, self._output_transport = self._output_transport, None
+            try:
+                output.close()
+            except Exception as exc:
+                self.get_logger().warning(f"failed to close output transport: {exc}")
+        if self._owns_input_transport and self._input_transport is not None:
+            input_transport, self._input_transport = self._input_transport, None
+            try:
+                input_transport.close()
+            except Exception as exc:
+                self.get_logger().warning(f"failed to close input transport: {exc}")
+        self._destroy_result = super().destroy_node()
+        return self._destroy_result
 
 
 def create_node(context: NodeBuildContext) -> SmplRefBridgeNode:
@@ -716,10 +1215,16 @@ def create_node(context: NodeBuildContext) -> SmplRefBridgeNode:
 
 
 __all__ = [
+    "BRIDGE_ALIASES",
     "BRIDGE_DEFAULTS",
     "IncomingChunk",
+    "MAX_PRODUCER_AGE_NS",
+    "PackedMessageInput",
+    "PackedTopicOutput",
     "PicoSourceReadinessGate",
     "SmplRefBridgeNode",
     "StreamedSmplRefMerger",
+    "ZmqPackedMessageInput",
+    "ZmqPackedTopicOutput",
     "create_node",
 ]
