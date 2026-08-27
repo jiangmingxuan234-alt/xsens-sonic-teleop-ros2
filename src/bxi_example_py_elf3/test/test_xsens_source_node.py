@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import rclpy
 import zmq
+from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -558,6 +559,37 @@ def test_epoch_status_precedes_first_new_epoch_pose(node_harness):
     ]
 
 
+def test_new_epoch_pose_is_not_deduplicated_by_same_newest_frame_index(
+    node_harness,
+):
+    node_harness.receiver.pending.append(
+        ReceivedDatagram(
+            build_mxtp02_packet(), 1, ("127.0.0.1", 4000)
+        )
+    )
+    node_harness.node._tick()
+    assert node_harness.publisher.sent[-1][0] == "pose"
+    assert int(node_harness.publisher.sent[-1][1]["source_epoch"][0]) == 71
+
+    node_harness.publisher.sent.clear()
+    node_harness.core.source_epoch = 72
+    node_harness.core.pose_fields = make_xsens_pose_fields(source_epoch=72)
+    node_harness.core.accept_results = [
+        AcceptResult(True, AcceptClassification.EPOCH_COMMITTED, True)
+    ]
+    node_harness.receiver.pending.append(
+        ReceivedDatagram(
+            build_mxtp02_packet(), 2, ("127.0.0.1", 4000)
+        )
+    )
+    node_harness.node._tick()
+    assert [topic for topic, _ in node_harness.publisher.sent] == [
+        "xsens_status",
+        "pose",
+    ]
+    assert int(node_harness.publisher.sent[-1][1]["source_epoch"][0]) == 72
+
+
 def test_status_send_failure_suppresses_pose_until_status_succeeds(
     node_harness,
 ):
@@ -585,7 +617,7 @@ def test_failed_receipt_status_keeps_existing_pose_behind_barrier(
     node_harness,
 ):
     node_harness.publisher.sent.clear()
-    node_harness.node._pose_pending = True
+    node_harness.node._pending_pose_key = (71, 109)
     node_harness.publisher.fail_next_topic = "xsens_status"
     message = make_arm_message(32, node_harness.core.source_epoch, 0)
     node_harness.node._arm_command_callback(message)
@@ -690,6 +722,33 @@ def test_final_stale_edge_suppresses_pose_from_accepted_backlog(node_harness):
     ]
 
 
+def test_inside_backlog_stale_edge_discards_retained_pose_when_packet_rejected(
+    node_harness,
+):
+    node_harness.publisher.sent.clear()
+    node_harness.node._pending_pose_key = (71, 109)
+    node_harness.core.accept_results = [
+        AcceptResult(False, AcceptClassification.CANDIDATE_STARTED)
+    ]
+    node_harness.receiver.pending.append(
+        ReceivedDatagram(
+            build_mxtp02_packet(), 900_000_000, ("127.0.0.1", 4000)
+        )
+    )
+    original_check_stale = node_harness.core.check_stale
+
+    def check_stale(now_ns):
+        original_check_stale(now_ns)
+        return now_ns == 900_000_000
+
+    node_harness.core.check_stale = check_stale
+    node_harness.node._tick()
+    assert [topic for topic, _ in node_harness.publisher.sent] == [
+        "xsens_status"
+    ]
+    assert node_harness.node._pending_pose_key is None
+
+
 def test_tick_drains_in_order_and_publishes_only_newest_progressing_window(
     integrated_node_harness,
 ):
@@ -755,6 +814,161 @@ def test_bind_failure_rolls_back_receiver(rclpy_runtime, xsens_source_context):
             ),
         )
     assert receiver.closed
+
+
+@pytest.mark.parametrize("owns_context", [True, False])
+def test_node_rollback_closes_socket_and_only_terminates_owned_zmq_context(
+    owns_context, monkeypatch, rclpy_runtime, xsens_source_context
+):
+    context = FakeZmqContext()
+    receiver = FakeReceiver()
+    monkeypatch.setattr(
+        XsensSourceNode,
+        "create_subscription",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("subscription failed")
+        ),
+    )
+    kwargs = {}
+    if owns_context:
+        monkeypatch.setattr("xsens.source_node.zmq.Context", lambda: context)
+    else:
+        kwargs["publisher_factory"] = lambda host, port: (
+            XsensPoseStatusPublisher(host, port, zmq_context=context)
+        )
+
+    with pytest.raises(RuntimeError, match="subscription failed"):
+        XsensSourceNode(
+            xsens_source_context,
+            receiver_factory=lambda **factory_kwargs: receiver,
+            **kwargs,
+        )
+    assert receiver.closed
+    assert context.fake_socket.close_calls == 1
+    assert context.term_calls == int(owns_context)
+
+
+@pytest.mark.parametrize(
+    "failure_stage,expected",
+    [
+        ("receiver", ["create_receiver", "super"]),
+        (
+            "publisher",
+            ["create_receiver", "create_publisher", "close_receiver", "super"],
+        ),
+        (
+            "subscription",
+            [
+                "create_receiver",
+                "create_publisher",
+                "create_subscription",
+                "close_publisher",
+                "close_receiver",
+                "super",
+            ],
+        ),
+        (
+            "timer",
+            [
+                "create_receiver",
+                "create_publisher",
+                "create_subscription",
+                "create_timer",
+                "destroy_subscription",
+                "close_publisher",
+                "close_receiver",
+                "super",
+            ],
+        ),
+        (
+            "startup_status",
+            [
+                "create_receiver",
+                "create_publisher",
+                "create_subscription",
+                "create_timer",
+                "destroy_timer",
+                "destroy_subscription",
+                "close_publisher",
+                "close_receiver",
+                "super",
+            ],
+        ),
+    ],
+)
+def test_partial_construction_failure_rolls_back_exact_acquired_resources(
+    failure_stage, expected, monkeypatch, rclpy_runtime, xsens_source_context
+):
+    events = []
+    core = FakeCore()
+    receiver = FakeReceiver()
+    publisher = FakePublisher()
+    original_super_destroy = Node.destroy_node
+
+    receiver.close = lambda: events.append("close_receiver")
+    publisher.close = lambda: events.append("close_publisher")
+    if failure_stage == "startup_status":
+        core.build_status_fields = lambda now_ns: (_ for _ in ()).throw(
+            RuntimeError("startup_status failed")
+        )
+
+    def receiver_factory(**kwargs):
+        events.append("create_receiver")
+        if failure_stage == "receiver":
+            raise RuntimeError("receiver failed")
+        return receiver
+
+    def publisher_factory(*args, **kwargs):
+        events.append("create_publisher")
+        if failure_stage == "publisher":
+            raise RuntimeError("publisher failed")
+        return publisher
+
+    def create_subscription(self, *args, **kwargs):
+        events.append("create_subscription")
+        if failure_stage == "subscription":
+            raise RuntimeError("subscription failed")
+        return object()
+
+    def create_timer(self, *args, **kwargs):
+        events.append("create_timer")
+        if failure_stage == "timer":
+            raise RuntimeError("timer failed")
+        return object()
+
+    def destroy_super(self):
+        events.append("super")
+        return original_super_destroy(self)
+
+    monkeypatch.setattr(
+        XsensSourceNode, "create_subscription", create_subscription
+    )
+    monkeypatch.setattr(XsensSourceNode, "create_timer", create_timer)
+    monkeypatch.setattr(
+        XsensSourceNode,
+        "destroy_subscription",
+        lambda self, resource: events.append("destroy_subscription") or True,
+    )
+    monkeypatch.setattr(
+        XsensSourceNode,
+        "destroy_timer",
+        lambda self, resource: events.append("destroy_timer") or True,
+    )
+    monkeypatch.setattr(Node, "destroy_node", destroy_super)
+
+    node = None
+    try:
+        with pytest.raises(RuntimeError, match=failure_stage):
+            node = XsensSourceNode(
+                xsens_source_context,
+                receiver_factory=receiver_factory,
+                core_factory=lambda *args, **kwargs: core,
+                publisher_factory=publisher_factory,
+            )
+    finally:
+        if node is not None:
+            node.destroy_node()
+    assert events == expected
 
 
 def test_resources_are_constructed_before_startup_status_in_contract_order(
@@ -842,6 +1056,61 @@ def test_destroy_node_reverses_resources_and_is_idempotent(node_harness):
     assert node_harness.receiver.closed and node_harness.publisher.closed
 
 
+def test_destroy_continues_after_every_cleanup_error_and_calls_super_last(
+    monkeypatch, node_harness
+):
+    events = []
+    logger = CaptureLogger()
+    node = node_harness.node
+    node.get_logger = lambda: logger
+    original_super_destroy = Node.destroy_node
+    original_destroy_timer = node.destroy_timer
+    original_destroy_subscription = node.destroy_subscription
+    timer_calls = 0
+    subscription_calls = 0
+
+    def fail(name):
+        events.append(name)
+        raise RuntimeError(f"{name} failed")
+
+    def destroy_timer(resource):
+        nonlocal timer_calls
+        timer_calls += 1
+        if timer_calls == 1:
+            fail("timer")
+        return original_destroy_timer(resource)
+
+    def destroy_subscription(resource):
+        nonlocal subscription_calls
+        subscription_calls += 1
+        if subscription_calls == 1:
+            fail("subscription")
+        return original_destroy_subscription(resource)
+
+    node.destroy_timer = destroy_timer
+    node.destroy_subscription = destroy_subscription
+    node_harness.publisher.close = lambda: fail("publisher")
+    node_harness.receiver.close = lambda: fail("receiver")
+
+    def destroy_super(self):
+        events.append("super")
+        return original_super_destroy(self)
+
+    monkeypatch.setattr(Node, "destroy_node", destroy_super)
+    assert node.destroy_node() is None
+    assert events == [
+        "timer",
+        "subscription",
+        "publisher",
+        "receiver",
+        "super",
+    ]
+    warnings = [
+        message for level, message in logger.events if level == "warning"
+    ]
+    assert len(warnings) == 4
+
+
 def test_repeated_source_lifecycle_uses_reserved_nonproduction_ports(
     rclpy_runtime,
 ):
@@ -900,6 +1169,81 @@ def test_diagnostics_include_unsent_status_age_and_transport_malformed_count(
     text = "\n".join(message for _, message in logger.events)
     assert "status_age_ms=5000.0" in text
     assert "malformed=2" in text
+
+
+@pytest.mark.parametrize("family", ["drain", "status", "accept", "pose"])
+def test_persistent_failure_diagnostics_are_immediate_then_five_second_bounded(
+    family, node_harness
+):
+    logger = CaptureLogger()
+    node_harness.node.get_logger = lambda: logger
+    original_send = node_harness.publisher.send
+
+    if family in ("status", "pose"):
+        def failing_send(topic, fields):
+            if topic == ("xsens_status" if family == "status" else "pose"):
+                raise RuntimeError(f"persistent {family}")
+            return original_send(topic, fields)
+
+        node_harness.publisher.send = failing_send
+
+    if family == "accept":
+        node_harness.core.accept = lambda packet: (_ for _ in ()).throw(
+            RuntimeError("persistent accept")
+        )
+
+    def trigger_failure():
+        if family == "drain":
+            node_harness.receiver.drain_error = RuntimeError(
+                "persistent drain"
+            )
+        elif family in ("accept", "pose"):
+            node_harness.receiver.pending.append(
+                ReceivedDatagram(
+                    build_mxtp02_packet(),
+                    node_harness.clock.now_ns,
+                    ("127.0.0.1", 4000),
+                )
+            )
+        node_harness.node._tick()
+
+    for _ in range(100):
+        node_harness.clock.advance_ns(20_000_000)
+        trigger_failure()
+    failures = [
+        message
+        for level, message in logger.events
+        if level == "error" and family in message.lower()
+    ]
+    assert len(failures) == 1
+
+    node_harness.clock.advance_ns(5_000_000_000)
+    trigger_failure()
+    failures = [
+        message
+        for level, message in logger.events
+        if level == "error" and family in message.lower()
+    ]
+    assert len(failures) == 2
+    assert "repeated=" in failures[-1]
+
+
+def test_changed_failure_signature_is_logged_immediately(node_harness):
+    logger = CaptureLogger()
+    node_harness.node.get_logger = lambda: logger
+    node_harness.receiver.drain_error = RuntimeError("first drain failure")
+    node_harness.node._tick()
+    node_harness.clock.advance_ns(20_000_000)
+    node_harness.receiver.drain_error = RuntimeError("changed drain failure")
+    node_harness.node._tick()
+    failures = [
+        message
+        for level, message in logger.events
+        if level == "error" and "drain" in message.lower()
+    ]
+    assert len(failures) == 2
+    assert "first drain failure" in failures[0]
+    assert "changed drain failure" in failures[1]
 
 
 def test_create_node_uses_context(rclpy_runtime, xsens_source_context):

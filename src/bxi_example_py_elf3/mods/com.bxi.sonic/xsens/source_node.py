@@ -273,8 +273,8 @@ class XsensSourceNode(Node):
         self._destroy_result = True
         self._pose_topic = str(params["pose_topic"])
         self._status_topic = str(params["status_topic"])
-        self._pose_pending = False
-        self._last_published_frame_index = None
+        self._pending_pose_key = None
+        self._last_published_pose_key = None
         self._malformed_packets = 0
         self._accepted_results = 0
         self._duplicate_results = 0
@@ -286,6 +286,7 @@ class XsensSourceNode(Node):
         self._last_diagnostic_summary_ns = None
         self._last_diagnostic_accepted = 0
         self._last_successful_status_ns = None
+        self._failure_diagnostics = {}
 
         try:
             allowed_sender = str(params["allowed_sender"])
@@ -335,7 +336,9 @@ class XsensSourceNode(Node):
             )
             now_ns = operator.index(self._clock_ns())
             with self._lock:
-                status_fields, _ = self._publish_status(now_ns)
+                status_fields, _ = self._publish_status(
+                    now_ns, propagate_error=True
+                )
                 self._maybe_log_diagnostics(now_ns, status_fields)
         except Exception:
             self._cleanup_failed_construction()
@@ -386,7 +389,7 @@ class XsensSourceNode(Node):
                     f"Xsens arm command callback failed: {error}"
                 )
 
-    def _publish_status(self, now_ns: int):
+    def _publish_status(self, now_ns: int, *, propagate_error=False):
         try:
             fields = self._core.build_status_fields(now_ns)
             sent = self._publisher.send(self._status_topic, fields)
@@ -394,10 +397,31 @@ class XsensSourceNode(Node):
                 self._last_successful_status_ns = now_ns
             return fields, bool(sent)
         except Exception as error:
-            self.get_logger().error(
-                f"Xsens status publication failed: {error}"
-            )
+            if propagate_error:
+                raise
+            self._report_failure("status publication", error, now_ns)
             return None, False
+
+    def _report_failure(self, family: str, error: Exception, now_ns: int):
+        signature = f"{type(error).__name__}: {error}"
+        state = self._failure_diagnostics.get(family)
+        if state is None or state[0] != signature:
+            self.get_logger().error(f"Xsens {family} failed: {signature}")
+            self._failure_diagnostics[family] = (signature, now_ns, 0)
+            return
+        _, last_log_ns, suppressed = state
+        if now_ns - last_log_ns >= _DIAGNOSTIC_SUMMARY_NS:
+            self.get_logger().error(
+                f"Xsens {family} failure repeated={suppressed + 1}: "
+                f"{signature}"
+            )
+            self._failure_diagnostics[family] = (signature, now_ns, 0)
+        else:
+            self._failure_diagnostics[family] = (
+                signature,
+                last_log_ns,
+                suppressed + 1,
+            )
 
     def _observe_accept_result(self, result) -> None:
         self._last_accept_classification = result.classification
@@ -411,12 +435,13 @@ class XsensSourceNode(Node):
             self._backward_results += 1
         self._inferred_drops += int(result.missing_frames)
 
-    def _drain_and_accept(self) -> None:
+    def _drain_and_accept(self, now_ns: int) -> bool:
+        stale_edge_seen = False
         try:
             datagrams = self._receiver.drain()
         except Exception as error:
-            self.get_logger().error(f"Xsens UDP drain failed: {error}")
-            return
+            self._report_failure("UDP drain", error, now_ns)
+            return stale_edge_seen
 
         for datagram in datagrams:
             try:
@@ -431,17 +456,21 @@ class XsensSourceNode(Node):
                 continue
 
             try:
-                self._core.check_stale(packet.receive_timestamp_ns)
+                if self._core.check_stale(packet.receive_timestamp_ns):
+                    stale_edge_seen = True
+                    self._pending_pose_key = None
                 result = self._core.accept(packet)
             except Exception as error:
                 self._core.note_invalid_input()
-                self.get_logger().error(
-                    f"Xsens packet acceptance failed: {error}"
-                )
+                self._report_failure("packet acceptance", error, now_ns)
                 continue
             self._observe_accept_result(result)
             if result.accepted:
-                self._pose_pending = True
+                self._pending_pose_key = (
+                    int(self._core.source_epoch),
+                    int(self._core.newest_frame_index),
+                )
+        return stale_edge_seen
 
     @staticmethod
     def _status_scalar(fields, name, default=0):
@@ -535,33 +564,40 @@ class XsensSourceNode(Node):
         try:
             self._core.expire(now_ns)
         except Exception as error:
-            self.get_logger().error(f"Xsens candidate expiry failed: {error}")
-        self._drain_and_accept()
+            self._report_failure("candidate expiry", error, now_ns)
+        stale_edge_seen = self._drain_and_accept(now_ns)
         try:
-            became_stale = bool(self._core.check_stale(now_ns))
+            final_stale_edge = bool(self._core.check_stale(now_ns))
         except Exception as error:
-            became_stale = True
-            self.get_logger().error(f"Xsens stale check failed: {error}")
-        if became_stale:
-            self._pose_pending = False
+            final_stale_edge = True
+            self._report_failure("stale check", error, now_ns)
+        if final_stale_edge:
+            self._pending_pose_key = None
+        became_stale = stale_edge_seen or final_stale_edge
 
         status_fields, status_sent = self._publish_status(now_ns)
-        if status_sent and self._pose_pending and not became_stale:
+        if (
+            status_sent
+            and self._pending_pose_key is not None
+            and not became_stale
+        ):
             try:
                 pose_fields = self._core.build_pose_fields()
                 if pose_fields is None:
-                    self._pose_pending = False
+                    self._pending_pose_key = None
                 else:
                     newest = int(np.asarray(pose_fields["frame_index"])[-1])
-                    if newest == self._last_published_frame_index:
-                        self._pose_pending = False
+                    source_epoch = int(
+                        np.asarray(pose_fields["source_epoch"])[0]
+                    )
+                    pose_key = (source_epoch, newest)
+                    if pose_key == self._last_published_pose_key:
+                        self._pending_pose_key = None
                     elif self._publisher.send(self._pose_topic, pose_fields):
-                        self._last_published_frame_index = newest
-                        self._pose_pending = False
+                        self._last_published_pose_key = pose_key
+                        self._pending_pose_key = None
             except Exception as error:
-                self.get_logger().error(
-                    f"Xsens pose publication failed: {error}"
-                )
+                self._report_failure("pose publication", error, now_ns)
         self._maybe_log_diagnostics(now_ns, status_fields)
 
     def _tick(self) -> None:
