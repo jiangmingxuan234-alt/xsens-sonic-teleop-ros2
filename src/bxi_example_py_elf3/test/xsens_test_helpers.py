@@ -60,6 +60,49 @@ class FakeDatagramSocket:
         self.closed = True
 
 
+class FakeZmqSocket:
+    def __init__(self) -> None:
+        self.options = []
+        self.bound = None
+        self.messages = []
+        self.closed = False
+        self.close_calls = 0
+        self.bind_error = None
+        self.send_error = None
+
+    def setsockopt(self, option, value) -> None:
+        self.options.append((option, value))
+
+    def bind(self, endpoint: str) -> None:
+        if self.bind_error is not None:
+            raise self.bind_error
+        self.bound = endpoint
+
+    def send(self, message: bytes, flags=0) -> None:
+        if self.send_error is not None:
+            error, self.send_error = self.send_error, None
+            raise error
+        self.messages.append((bytes(message), flags))
+
+    def close(self, linger=None) -> None:
+        self.close_calls += 1
+        self.closed = True
+
+
+class FakeZmqContext:
+    def __init__(self, socket=None) -> None:
+        self.fake_socket = socket or FakeZmqSocket()
+        self.socket_types = []
+        self.term_calls = 0
+
+    def socket(self, socket_type):
+        self.socket_types.append(socket_type)
+        return self.fake_socket
+
+    def term(self) -> None:
+        self.term_calls += 1
+
+
 def _reserve_port(sock_type: int) -> int:
     with socket.socket(socket.AF_INET, sock_type) as reservation:
         reservation.bind(("127.0.0.1", 0))
