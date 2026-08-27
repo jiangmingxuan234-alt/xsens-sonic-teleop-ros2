@@ -11,6 +11,7 @@ from xsens.source_core import (
     CounterKind,
     SourceCoreStats,
     TimeCodeMode,
+    XsensSourceCore,
     classify_uint32_delta,
     draw_new_epoch,
 )
@@ -268,6 +269,23 @@ def test_advancing_time_code_duplicate_is_active_compatible():
     assert core.candidate_frame_count == 0
 
 
+def test_time_code_stays_unknown_or_constant_until_actual_advancement():
+    core, _ = make_core(epoch_draws=(91, 92))
+    assert core.time_code_mode is TimeCodeMode.UNKNOWN_OR_CONSTANT
+
+    accept_packet(core, 1, timestamp_ns=1, time_code=0)
+    assert core.time_code_mode is TimeCodeMode.UNKNOWN_OR_CONSTANT
+    accept_packet(core, 2, timestamp_ns=2, time_code=0)
+    assert core.time_code_mode is TimeCodeMode.UNKNOWN_OR_CONSTANT
+    accept_packet(core, 3, timestamp_ns=3, time_code=50)
+    assert core.time_code_mode is TimeCodeMode.UNKNOWN_OR_CONSTANT
+    accept_packet(core, 4, timestamp_ns=4, time_code=50)
+    assert core.time_code_mode is TimeCodeMode.UNKNOWN_OR_CONSTANT
+
+    accept_packet(core, 5, timestamp_ns=5, time_code=51)
+    assert core.time_code_mode is TimeCodeMode.ADVANCING
+
+
 def test_counter_regression_wins_over_forward_time_code():
     core, _ = make_core(epoch_draws=(91, 92))
     accept_packet(core, 1000, timestamp_ns=0, time_code=100)
@@ -309,6 +327,35 @@ def test_changed_sender_requires_strictly_stale_active_producer():
     assert first.classification is AcceptClassification.CANDIDATE_STARTED
     assert second.classification is AcceptClassification.EPOCH_COMMITTED
     assert core.locked_sender == ("127.0.0.1", 5000, 0)
+
+
+def test_changed_character_id_uses_full_sender_key_and_strict_staleness():
+    core, _ = make_core(epoch_draws=(91, 92))
+    accept_packet(core, 1, timestamp_ns=0, character_id=0)
+
+    at_boundary = accept_packet(
+        core, 1, timestamp_ns=500_000_000, character_id=1
+    )
+    assert (
+        at_boundary.classification
+        is AcceptClassification.SENDER_INELIGIBLE
+    )
+    assert core.locked_sender == ("127.0.0.1", 4000, 0)
+    assert core.candidate_frame_count == 0
+
+    first = accept_packet(
+        core, 1, timestamp_ns=500_000_001, character_id=1
+    )
+    assert first.classification is AcceptClassification.CANDIDATE_STARTED
+    assert core.candidate_sender == ("127.0.0.1", 4000, 1)
+    assert core.candidate_frame_count == 1
+
+    second = accept_packet(
+        core, 2, timestamp_ns=510_000_000, character_id=1
+    )
+    assert second.classification is AcceptClassification.EPOCH_COMMITTED
+    assert core.source_epoch == 92
+    assert core.locked_sender == ("127.0.0.1", 4000, 1)
 
 
 def test_eligible_changed_sender_replaces_incoherent_candidate_sender():
@@ -451,6 +498,60 @@ def test_failed_second_candidate_conversion_does_not_partially_commit(
         backwards=1,
         reset_candidates=1,
         conversion_failures=1,
+    )
+
+
+def test_epoch_factory_exception_leaves_candidate_and_active_state_atomic():
+    converter = XsensMotionConverter()
+    draw_count = 0
+
+    def epoch_factory():
+        nonlocal draw_count
+        draw_count += 1
+        if draw_count == 1:
+            return 91
+        raise RuntimeError("epoch draw failed")
+
+    core = XsensSourceCore(
+        converter,
+        clock_ns=lambda: 0,
+        epoch_factory=epoch_factory,
+    )
+
+    def source_snapshot():
+        return (
+            core.source_epoch,
+            core.locked_sender,
+            core.newest_frame_index,
+            core.newest_producer_monotonic_ns,
+            core.time_code_mode,
+            core.candidate_frame_count,
+            core.candidate_sender,
+            tuple(
+                packet.header.sample_counter
+                for packet in core._candidate_packets
+            ),
+            core._candidate_first_timestamp_ns,
+            tuple(frame.frame_index for frame in core._output_frames),
+            tuple(frame.frame_index for frame in core._readiness_frames),
+            core.stats,
+        )
+
+    accept_packet(core, 1000, timestamp_ns=0, time_code=100)
+    accept_packet(core, 1001, timestamp_ns=10, time_code=101)
+    accept_packet(core, 900, timestamp_ns=600_000_000, time_code=90)
+    before = source_snapshot()
+    converter_before = converter.previous_raw_quats_xyzw
+
+    with pytest.raises(RuntimeError, match="epoch draw failed"):
+        accept_packet(
+            core, 901, timestamp_ns=610_000_000, time_code=91
+        )
+
+    assert draw_count == 2
+    assert source_snapshot() == before
+    np.testing.assert_array_equal(
+        converter.previous_raw_quats_xyzw, converter_before
     )
 
 

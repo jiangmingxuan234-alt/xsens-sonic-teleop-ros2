@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 import socket
 import struct
 from typing import TYPE_CHECKING
@@ -189,12 +190,16 @@ def accept_packet(
     timestamp_ns,
     time_code=0,
     sender=("127.0.0.1", 4000),
+    character_id=0,
 ):
-    return core.accept(
-        make_packet(
-            sample_counter=counter,
-            time_code=time_code,
-            sender=sender,
-            receive_timestamp_ns=timestamp_ns,
-        )
+    packet = make_packet(
+        sample_counter=counter,
+        time_code=time_code,
+        sender=sender,
+        receive_timestamp_ns=timestamp_ns,
     )
+    packet = replace(
+        packet,
+        header=replace(packet.header, character_id=character_id),
+    )
+    return core.accept(packet)
