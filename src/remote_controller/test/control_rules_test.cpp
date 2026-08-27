@@ -283,6 +283,43 @@ void test_xsens_gamepad_chord_emits_btn_10_11()
     expect(message.btn_10 == 11);
 }
 
+void test_xsens_gamepad_chord_transitions_11_zero_11()
+{
+    InputMapper mapper(remote_controller::load_remote_config(
+        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+    communication::msg::MotionCommands message;
+
+    mapper.set_signals({
+        {"js.axis.5", 1.0},
+        {"js.axis.4", 1.0},
+        {"js.button.4", 1.0},
+        {"js.button.6", 0.0},
+        {"js.button.7", 0.0},
+    });
+    mapper.fill_message(message);
+    expect(message.btn_10 == 11);
+
+    mapper.set_signals({
+        {"js.axis.5", 0.0},
+        {"js.axis.4", 0.0},
+        {"js.button.4", 0.0},
+        {"js.button.6", 0.0},
+        {"js.button.7", 0.0},
+    });
+    mapper.fill_message(message);
+    expect(message.btn_10 == 0);
+
+    mapper.set_signals({
+        {"js.axis.5", 1.0},
+        {"js.axis.4", 1.0},
+        {"js.button.4", 1.0},
+        {"js.button.6", 0.0},
+        {"js.button.7", 0.0},
+    });
+    mapper.fill_message(message);
+    expect(message.btn_10 == 11);
+}
+
 void test_xsens_crsf_chord_emits_btn_10_11()
 {
     InputMapper mapper(remote_controller::load_remote_config(
@@ -442,6 +479,7 @@ int main()
     test_debug_reports_changed_rule_selection();
     test_three_button_chord_excludes_two_button_x_chords();
     test_xsens_gamepad_chord_emits_btn_10_11();
+    test_xsens_gamepad_chord_transitions_11_zero_11();
     test_xsens_crsf_chord_emits_btn_10_11();
     test_xsens_chord_guards_and_release();
     test_xsens_crsf_guards_and_release();
