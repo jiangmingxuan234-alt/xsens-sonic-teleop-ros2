@@ -1384,7 +1384,7 @@ XsensSourceCore(
     [
         (10, 10, CounterKind.DUPLICATE, 0),
         (10, 11, CounterKind.FORWARD, 0),
-        (10, 14, CounterKind.FORWARD, 2),
+        (10, 14, CounterKind.FORWARD, 3),
         (0xFFFFFFFF, 0, CounterKind.FORWARD, 0),
         (0, 0x80000000, CounterKind.AMBIGUOUS, 0),
         (1000, 900, CounterKind.BACKWARD, 0),
