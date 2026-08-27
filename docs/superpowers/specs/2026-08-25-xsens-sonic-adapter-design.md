@@ -2,8 +2,7 @@
 
 Date: 2026-08-25
 
-Status: Proposed written specification based on the approved interaction
-design; pending user review
+Status: Approved by the user on 2026-08-26
 
 ## 1. Purpose
 
