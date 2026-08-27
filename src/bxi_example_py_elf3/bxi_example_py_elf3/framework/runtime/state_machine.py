@@ -40,20 +40,8 @@ class RemoteEventAdapter:
         event_slots: Mapping[str, object],
         initial_values: Mapping[str, int] | None = None,
     ) -> None:
-        self._event_slots = dict(event_slots)
-        self._last_values = {name: 0 for name in self._event_slots}
-        if initial_values:
-            self._last_values.update(
-                {
-                    name: int(value)
-                    for name, value in initial_values.items()
-                    if name in self._last_values
-                }
-            )
-
-    def extract_events(self, msg: object, sync_only: bool = False) -> list[str]:
-        events: list[str] = []
-        for event_name, slot_config in self._event_slots.items():
+        self._event_slots: dict[str, tuple[str, object | None]] = {}
+        for event_name, slot_config in event_slots.items():
             if isinstance(slot_config, Mapping):
                 slot_name = slot_config.get("slot")
                 expected_value = slot_config.get("value")
@@ -64,7 +52,36 @@ class RemoteEventAdapter:
                 raise ValueError(
                     f"remote event '{event_name}' must define a string slot"
                 )
-            value = int(getattr(msg, slot_name, 0))
+            self._event_slots[event_name] = (slot_name, expected_value)
+
+        self._last_values = {name: 0 for name in self._event_slots}
+        self._latest_slot_values = {
+            slot_name: 0 for slot_name, _ in self._event_slots.values()
+        }
+        if initial_values:
+            self._last_values.update(
+                {
+                    name: int(value)
+                    for name, value in initial_values.items()
+                    if name in self._last_values
+                }
+            )
+
+    def remote_slot_value(self, slot: str) -> int:
+        if slot not in self._latest_slot_values:
+            raise KeyError(f"undeclared remote slot: {slot}")
+        return self._latest_slot_values[slot]
+
+    def extract_events(self, msg: object, sync_only: bool = False) -> list[str]:
+        slot_values = {
+            slot_name: int(getattr(msg, slot_name, 0))
+            for slot_name in self._latest_slot_values
+        }
+        self._latest_slot_values.update(slot_values)
+
+        events: list[str] = []
+        for event_name, (slot_name, expected_value) in self._event_slots.items():
+            value = slot_values[slot_name]
             previous = self._last_values.get(event_name, 0)
             self._last_values[event_name] = value
             if sync_only:

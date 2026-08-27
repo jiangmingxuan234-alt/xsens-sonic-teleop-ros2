@@ -252,6 +252,9 @@ class RobotControlFramework:
     ) -> list[str]:
         return self.remote_event_adapter.extract_events(values, sync_only=sync_only)
 
+    def remote_slot_value(self, slot: str) -> int:
+        return self.remote_event_adapter.remote_slot_value(slot)
+
     def request_state(
         self,
         state_name: str,

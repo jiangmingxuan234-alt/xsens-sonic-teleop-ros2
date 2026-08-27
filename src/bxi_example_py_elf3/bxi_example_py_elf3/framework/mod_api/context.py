@@ -63,6 +63,9 @@ class RobotControlContext(Protocol):
         """Return the underlying ROS node for advanced integrations."""
         ...
 
+    def remote_slot_value(self, slot: str) -> int:
+        ...
+
     def resolve_motor_frame(
         self,
         frame: "MotorFrame",
