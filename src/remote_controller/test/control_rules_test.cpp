@@ -1,10 +1,15 @@
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "remote_controller/input_mapper.hpp"
+
+#include <yaml-cpp/yaml.h>
 
 namespace {
 
@@ -260,6 +265,69 @@ void test_three_button_chord_excludes_two_button_x_chords()
     }
 }
 
+std::string write_filter_fixture(const std::string &required_filter)
+{
+    YAML::Node root = YAML::LoadFile(REMOTE_CONTROLLER_TEST_CONFIG_PATH);
+    YAML::Node binding;
+    binding["output"] = "btn_10=11";
+    binding["requires_driver_filter"] = required_filter;
+    binding["when"].push_back("keyboard.sonic_event");
+    root["outputs"]["level"].push_back(binding);
+    const std::string path = "/tmp/remote_controller_driver_filter_test.yaml";
+    std::ofstream stream(path);
+    stream << root;
+    stream.close();
+    return path;
+}
+
+void test_binding_driver_filter_selection()
+{
+    const std::string path = write_filter_fixture("keyboard");
+    const RemoteConfig hardware = remote_controller::load_remote_config(
+        path);
+    const RemoteConfig keyboard = remote_controller::load_remote_config(
+        path, "keyboard");
+    const RemoteConfig joystick = remote_controller::load_remote_config(
+        path, "joystick");
+
+    const auto has_keyboard_xsens = [](const RemoteConfig &config) {
+        return std::any_of(
+            config.bindings.begin(), config.bindings.end(),
+            [](const remote_controller::Binding &binding) {
+                return binding.output == "btn_10=11" &&
+                    binding.requires_driver_filter == "keyboard";
+            });
+    };
+    expect(!has_keyboard_xsens(hardware));
+    expect(has_keyboard_xsens(keyboard));
+    expect(!has_keyboard_xsens(joystick));
+
+    const auto ungated_outputs = [](const RemoteConfig &config) {
+        std::vector<std::string> outputs;
+        for (const auto &binding : config.bindings) {
+            if (binding.requires_driver_filter.empty()) {
+                outputs.push_back(binding.output);
+            }
+        }
+        return outputs;
+    };
+    expect(ungated_outputs(hardware) == ungated_outputs(keyboard));
+    std::remove(path.c_str());
+}
+
+void test_unknown_binding_driver_filter_is_rejected()
+{
+    const std::string path = write_filter_fixture("unknown_driver");
+    bool threw = false;
+    try {
+        remote_controller::load_remote_config(path, "keyboard");
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    std::remove(path.c_str());
+    expect(threw);
+}
+
 }  // namespace
 
 int main()
@@ -269,5 +337,7 @@ int main()
     test_bool_all_keeps_inactive_raw_inputs_in_the_selected_group();
     test_debug_reports_changed_rule_selection();
     test_three_button_chord_excludes_two_button_x_chords();
+    test_binding_driver_filter_selection();
+    test_unknown_binding_driver_filter_is_rejected();
     return 0;
 }

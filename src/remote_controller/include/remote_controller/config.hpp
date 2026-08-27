@@ -90,6 +90,7 @@ struct AnalogOutputConfig {
 struct Binding {
     std::string output;
     std::string mode;
+    std::string requires_driver_filter;
     ConditionConfig when;
 };
 
@@ -195,7 +196,9 @@ struct RemoteConfig {
     std::vector<ConfigDiagnostic> diagnostics;
 };
 
-RemoteConfig load_remote_config(const std::string &path);
+RemoteConfig load_remote_config(
+    const std::string &path,
+    const std::string &driver_filter = "");
 char key_from_name(const std::string &name);
 bool starts_with(const std::string &value, const std::string &prefix);
 
