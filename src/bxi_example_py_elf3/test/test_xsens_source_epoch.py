@@ -525,6 +525,9 @@ def test_epoch_factory_exception_leaves_candidate_and_active_state_atomic():
             core.newest_frame_index,
             core.newest_producer_monotonic_ns,
             core.time_code_mode,
+            core._sample_counter,
+            core._time_code_probe,
+            core._trusted_time_code,
             core.candidate_frame_count,
             core.candidate_sender,
             tuple(
@@ -540,6 +543,11 @@ def test_epoch_factory_exception_leaves_candidate_and_active_state_atomic():
     accept_packet(core, 1000, timestamp_ns=0, time_code=100)
     accept_packet(core, 1001, timestamp_ns=10, time_code=101)
     accept_packet(core, 900, timestamp_ns=600_000_000, time_code=90)
+    assert (
+        core._sample_counter,
+        core._time_code_probe,
+        core._trusted_time_code,
+    ) == (1001, 101, 101)
     before = source_snapshot()
     converter_before = converter.previous_raw_quats_xyzw
 
