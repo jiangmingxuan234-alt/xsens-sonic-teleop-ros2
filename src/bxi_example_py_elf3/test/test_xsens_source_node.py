@@ -853,13 +853,41 @@ def test_node_rollback_closes_socket_and_only_terminates_owned_zmq_context(
     [
         ("receiver", ["create_receiver", "super"]),
         (
+            "converter",
+            [
+                "create_receiver",
+                "create_converter",
+                "close_receiver",
+                "super",
+            ],
+        ),
+        (
+            "core",
+            [
+                "create_receiver",
+                "create_converter",
+                "create_core",
+                "close_receiver",
+                "super",
+            ],
+        ),
+        (
             "publisher",
-            ["create_receiver", "create_publisher", "close_receiver", "super"],
+            [
+                "create_receiver",
+                "create_converter",
+                "create_core",
+                "create_publisher",
+                "close_receiver",
+                "super",
+            ],
         ),
         (
             "subscription",
             [
                 "create_receiver",
+                "create_converter",
+                "create_core",
                 "create_publisher",
                 "create_subscription",
                 "close_publisher",
@@ -871,6 +899,8 @@ def test_node_rollback_closes_socket_and_only_terminates_owned_zmq_context(
             "timer",
             [
                 "create_receiver",
+                "create_converter",
+                "create_core",
                 "create_publisher",
                 "create_subscription",
                 "create_timer",
@@ -884,6 +914,8 @@ def test_node_rollback_closes_socket_and_only_terminates_owned_zmq_context(
             "startup_status",
             [
                 "create_receiver",
+                "create_converter",
+                "create_core",
                 "create_publisher",
                 "create_subscription",
                 "create_timer",
@@ -901,6 +933,7 @@ def test_partial_construction_failure_rolls_back_exact_acquired_resources(
 ):
     events = []
     core = FakeCore()
+    converter = object()
     receiver = FakeReceiver()
     publisher = FakePublisher()
     original_super_destroy = Node.destroy_node
@@ -923,6 +956,19 @@ def test_partial_construction_failure_rolls_back_exact_acquired_resources(
         if failure_stage == "publisher":
             raise RuntimeError("publisher failed")
         return publisher
+
+    def converter_factory():
+        events.append("create_converter")
+        if failure_stage == "converter":
+            raise RuntimeError("converter failed")
+        return converter
+
+    def core_factory(value, **kwargs):
+        assert value is converter
+        events.append("create_core")
+        if failure_stage == "core":
+            raise RuntimeError("core failed")
+        return core
 
     def create_subscription(self, *args, **kwargs):
         events.append("create_subscription")
@@ -962,7 +1008,8 @@ def test_partial_construction_failure_rolls_back_exact_acquired_resources(
             node = XsensSourceNode(
                 xsens_source_context,
                 receiver_factory=receiver_factory,
-                core_factory=lambda *args, **kwargs: core,
+                converter_factory=converter_factory,
+                core_factory=core_factory,
                 publisher_factory=publisher_factory,
             )
     finally:
