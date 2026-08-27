@@ -82,6 +82,7 @@ sources:
       keyboard.normal: {from: keyboard.key, key: "1", hold_ms: 200}
       keyboard.pd_break: {from: keyboard.key, key: "!"}
       keyboard.sonic: {from: keyboard.key, key: "@"}
+      keyboard.xsens: {from: keyboard.key, key: r, hold_ms: 200}
       keyboard.recover: {from: keyboard.key, key: "2"}
       keyboard.dance: {from: keyboard.key, key: "3"}
       keyboard.amp_run: {from: keyboard.key, key: "4"}
@@ -293,6 +294,7 @@ controls:
   keyboard.normal_event: {type: bool, inputs: [{source: keyboard.normal}]}
   keyboard.pd_break_event: {type: bool, inputs: [{source: keyboard.pd_break}]}
   keyboard.sonic_event: {type: bool, inputs: [{source: keyboard.sonic}]}
+  keyboard.xsens_event: {type: bool, inputs: [{source: keyboard.xsens}]}
   keyboard.recover_event: {type: bool, inputs: [{source: keyboard.recover}]}
   keyboard.dance_event: {type: bool, inputs: [{source: keyboard.dance}]}
   keyboard.amp_run_event: {type: bool, inputs: [{source: keyboard.amp_run}]}
@@ -506,6 +508,18 @@ outputs:
             - button.y_event
             - released: trigger.left_event
             - released: trigger.right_event
+
+    - output: btn_10=11
+      when:
+        - trigger.left_event
+        - trigger.right_event
+        - button.y_event
+        - released: shoulder.left_event
+        - released: shoulder.right_event
+
+    - output: btn_10=11
+      requires_driver_filter: keyboard
+      when: [keyboard.xsens_event]
 
 #自定义命令
 system:
