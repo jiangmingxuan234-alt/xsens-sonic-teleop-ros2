@@ -127,6 +127,23 @@ def test_shortest_path_slerp_ignores_opposite_endpoint_sign():
     assert abs(float(np.dot(midpoint, expected))) == pytest.approx(1.0)
 
 
+def test_shortest_path_slerp_honors_literal_zero_and_one_endpoints():
+    start = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    opposite_end = np.array(
+        [0.0, 0.0, -0.5, -0.8660254037844386], dtype=np.float64
+    )
+
+    at_start = shortest_path_slerp(start, opposite_end, 0.0)
+    at_aligned_end = shortest_path_slerp(start, opposite_end, 1.0)
+
+    np.testing.assert_allclose(at_start, [0.0, 0.0, 0.0, 1.0], atol=1e-7)
+    np.testing.assert_allclose(
+        at_aligned_end,
+        [0.0, 0.0, 0.5, 0.8660254],
+        atol=1e-7,
+    )
+
+
 @pytest.mark.parametrize(
     "smpl_index,segment_id", EXPECTED_DIRECT_MAPPING
 )
@@ -193,10 +210,11 @@ def test_parent_local_rotation_multiplies_inverse_parent_before_child():
 
 
 def test_real_fk_output_has_exact_contract_and_only_six_wrist_slots():
-    frame = XsensMotionConverter().convert(make_packet(), frame_index=17)
+    packet = make_packet(receive_timestamp_ns=987_654_321_012)
+    frame = XsensMotionConverter().convert(packet, frame_index=17)
 
     assert frame.frame_index == 17
-    assert frame.receive_timestamp_ns == 0
+    assert frame.receive_timestamp_ns == 987_654_321_012
     assert frame.segment_positions_xrt.shape == (23, 3)
     assert frame.segment_quat_xrt_xyzw.shape == (23, 4)
     assert frame.smpl_joints.shape == (24, 3)
@@ -226,6 +244,97 @@ def test_real_fk_output_has_exact_contract_and_only_six_wrist_slots():
     assert np.linalg.norm(frame.body_quat_w) == pytest.approx(1.0, abs=1e-6)
     with pytest.raises(FrozenInstanceError):
         frame.frame_index = 18
+
+
+def test_converter_selects_exact_fk_fields_pose_rows_and_wxyz_root(
+    monkeypatch,
+):
+    fake_smpl_pose = (
+        np.arange(69, dtype=np.float32).reshape(1, 69) + np.float32(0.25)
+    )
+    expected_body_pose = np.array(
+        [
+            [0.25, 1.25, 2.25],
+            [3.25, 4.25, 5.25],
+            [6.25, 7.25, 8.25],
+            [9.25, 10.25, 11.25],
+            [12.25, 13.25, 14.25],
+            [15.25, 16.25, 17.25],
+            [18.25, 19.25, 20.25],
+            [21.25, 22.25, 23.25],
+            [24.25, 25.25, 26.25],
+            [27.25, 28.25, 29.25],
+            [30.25, 31.25, 32.25],
+            [33.25, 34.25, 35.25],
+            [36.25, 37.25, 38.25],
+            [39.25, 40.25, 41.25],
+            [42.25, 43.25, 44.25],
+            [45.25, 46.25, 47.25],
+            [48.25, 49.25, 50.25],
+            [51.25, 52.25, 53.25],
+            [54.25, 55.25, 56.25],
+            [57.25, 58.25, 59.25],
+            [60.25, 61.25, 62.25],
+        ],
+        dtype=np.float32,
+    )
+    global_joints = -(
+        np.arange(72, dtype=np.float32).reshape(1, 24, 3)
+        + np.float32(1000.25)
+    )
+    local_joints = (
+        np.arange(72, dtype=np.float32).reshape(1, 24, 3)
+        + np.float32(100.25)
+    )
+    root_wxyz = np.array(
+        [[0.18257418, 0.36514837, 0.5477226, 0.73029673]],
+        dtype=np.float32,
+    )
+    fake_fk_result = {
+        "smpl_pose": fake_smpl_pose,
+        "joints": global_joints,
+        "smpl_joints_local": local_joints,
+        "global_orient_quat": root_wxyz,
+        "global_orient_6d": np.array(
+            [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]], dtype=np.float32
+        ),
+        "adjusted_transl": np.array(
+            [[7.0, 8.0, 9.0]], dtype=np.float32
+        ),
+    }
+    expected_joint_pos = np.zeros((1, 29), dtype=np.float32)
+    expected_joint_pos[0, [19, 20, 21, 26, 27, 28]] = [
+        0.11,
+        0.12,
+        0.13,
+        -0.21,
+        -0.22,
+        0.23,
+    ]
+    captured = {}
+
+    def fake_fk(parents, body_poses):
+        return fake_fk_result
+
+    def fake_wrist(smpl_body_pose):
+        captured["wrist_input"] = smpl_body_pose.copy()
+        return expected_joint_pos
+
+    monkeypatch.setattr(converter_module, "compute_from_body_poses", fake_fk)
+    monkeypatch.setattr(
+        converter_module, "build_elf3_joint_pos", fake_wrist
+    )
+
+    frame = XsensMotionConverter().convert(make_packet(), frame_index=1)
+
+    np.testing.assert_array_equal(frame.smpl_body_pose, expected_body_pose)
+    np.testing.assert_array_equal(
+        captured["wrist_input"], expected_body_pose[None, ...]
+    )
+    np.testing.assert_array_equal(frame.smpl_joints, local_joints[0])
+    assert not np.array_equal(frame.smpl_joints, global_joints[0])
+    np.testing.assert_array_equal(frame.body_quat_w, root_wxyz[0])
+    np.testing.assert_array_equal(frame.joint_pos, expected_joint_pos[0])
 
 
 def test_frame_owns_read_only_copies_of_packet_transform_arrays():
