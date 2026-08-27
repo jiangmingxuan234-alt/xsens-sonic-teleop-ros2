@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import numpy as np
 import pytest
@@ -237,6 +237,48 @@ def test_structurally_invalid_commands_do_not_replace_receipt(command):
     assert status["reason_code"].tolist() == [XsensReason.INVALID_INPUT]
 
 
+def test_malformed_command_preserves_existing_receipt_and_source_state():
+    core, clock = ready_core(epoch=91)
+    assert core.handle_arm_command(ArmCommand(801, 91, 91)) == (
+        ArmCommandResult(
+            ArmCommandClassification.ARMED, True, True, True
+        )
+    )
+    status_before = core.build_status_fields(clock.now_ns)
+    receipt_before = {
+        name: status_before[name].tolist()
+        for name in (
+            "last_arm_command_id",
+            "last_arm_target_epoch",
+            "last_requested_arm_epoch",
+            "accepted_arm_epoch",
+        )
+    }
+    seen_before = core._seen_arm_commands.copy()
+    window_before = core.current_pose_window()
+    stats_before = core.stats
+    authorization_before = core.accepted_arm_epoch
+
+    assert core.handle_arm_command(ArmCommand(0, 91, 91)) == (
+        ArmCommandResult(
+            ArmCommandClassification.INVALID, False, False, False
+        )
+    )
+
+    status_after = core.build_status_fields(clock.now_ns)
+    assert {
+        name: status_after[name].tolist() for name in receipt_before
+    } == receipt_before
+    assert status_after["reason_code"].tolist() == [11]
+    assert core._seen_arm_commands == seen_before
+    assert core.accepted_arm_epoch == authorization_before
+    assert core.stats == stats_before
+    assert all(
+        actual is expected
+        for actual, expected in zip(core.current_pose_window(), window_before)
+    )
+
+
 def test_signed_int64_numpy_values_are_accepted_without_bool_coercion():
     core, clock = ready_core(91)
     result = core.handle_arm_command(
@@ -292,6 +334,49 @@ def test_duplicate_disarm_does_not_restart_post_barrier_readiness():
     )
     assert core.ready_frames == 1
     assert core.stats == stats_before
+
+
+def test_not_ready_replay_is_exact_duplicate_without_state_changes():
+    core, clock = make_core(epoch_draws=(91, 92))
+    feed_stable_frames(core, clock, 10)
+    command = ArmCommand(811, 91, 91)
+    assert core.handle_arm_command(command) == ArmCommandResult(
+        ArmCommandClassification.NOT_READY, True, True, True
+    )
+    status_before = core.build_status_fields(clock.now_ns)
+    observed_before = {
+        name: status_before[name].tolist()
+        for name in (
+            "last_arm_command_id",
+            "last_arm_target_epoch",
+            "last_requested_arm_epoch",
+            "accepted_arm_epoch",
+            "ready",
+            "reference_window_ready",
+            "ready_frames",
+            "recovery_frames",
+            "reason_code",
+        )
+    }
+    seen_before = core._seen_arm_commands.copy()
+    window_before = core.current_pose_window()
+    stats_before = core.stats
+
+    assert core.handle_arm_command(command) == ArmCommandResult(
+        ArmCommandClassification.DUPLICATE, False, False, False
+    )
+
+    status_after = core.build_status_fields(clock.now_ns)
+    assert {
+        name: status_after[name].tolist() for name in observed_before
+    } == observed_before
+    assert core._seen_arm_commands == seen_before
+    assert core.accepted_arm_epoch == 0
+    assert core.stats == stats_before
+    assert all(
+        actual is expected
+        for actual, expected in zip(core.current_pose_window(), window_before)
+    )
 
 
 def test_first_seen_not_ready_arm_is_echoed_but_not_accepted():
@@ -367,6 +452,48 @@ def test_target_mismatch_preserves_existing_authorization():
     )
 
 
+def test_target_mismatch_replay_is_exact_duplicate_without_state_changes():
+    core, clock = ready_core(91)
+    command = ArmCommand(812, 90, 90)
+    assert core.handle_arm_command(command) == ArmCommandResult(
+        ArmCommandClassification.TARGET_MISMATCH, True, True, True
+    )
+    status_before = core.build_status_fields(clock.now_ns)
+    observed_before = {
+        name: status_before[name].tolist()
+        for name in (
+            "last_arm_command_id",
+            "last_arm_target_epoch",
+            "last_requested_arm_epoch",
+            "accepted_arm_epoch",
+            "ready",
+            "reference_window_ready",
+            "ready_frames",
+            "recovery_frames",
+            "reason_code",
+        )
+    }
+    seen_before = core._seen_arm_commands.copy()
+    window_before = core.current_pose_window()
+    stats_before = core.stats
+
+    assert core.handle_arm_command(command) == ArmCommandResult(
+        ArmCommandClassification.DUPLICATE, False, False, False
+    )
+
+    status_after = core.build_status_fields(clock.now_ns)
+    assert {
+        name: status_after[name].tolist() for name in observed_before
+    } == observed_before
+    assert core._seen_arm_commands == seen_before
+    assert core.accepted_arm_epoch == 0
+    assert core.stats == stats_before
+    assert all(
+        actual is expected
+        for actual, expected in zip(core.current_pose_window(), window_before)
+    )
+
+
 def test_old_target_disarm_after_epoch_commit_preserves_two_replayed_frames():
     core, clock = ready_core(91)
     core.handle_arm_command(ArmCommand(22, 91, 91))
@@ -435,6 +562,18 @@ def test_pose_build_requires_fresh_complete_strictly_progressing_window():
     assert core.build_pose_fields() is None
 
 
+def test_full_output_window_with_repeated_index_is_not_reference_ready():
+    core, _ = ready_core(91)
+    window = core.current_pose_window()
+    core._output_frames[-1] = replace(
+        window[-1], frame_index=window[-2].frame_index
+    )
+
+    assert core.reference_window_ready is False
+    assert core.current_pose_window() is None
+    assert core.build_pose_fields() is None
+
+
 def test_pose_and_status_fields_are_immutable_fresh_copies_without_aliasing():
     core, clock = ready_core(91)
     first_pose = core.build_pose_fields()
@@ -476,6 +615,43 @@ def test_status_fields_have_exact_shapes_dtypes_sentinels_and_ranges():
     assert 0 <= int(fields["ready_frames"][0]) <= 30
     assert 0 <= int(fields["recovery_frames"][0]) <= 10
     assert int(fields["reason_code"][0]) in set(XsensReason)
+
+
+def test_status_fields_preserve_exact_field_provenance():
+    core, clock = ready_core(91)
+    assert core.handle_arm_command(ArmCommand(707, 91, 0)) == (
+        ArmCommandResult(
+            ArmCommandClassification.DISARMED, True, True, True
+        )
+    )
+    feed_stable_frames(core, clock, 10)
+    core._status_sequence = 52
+
+    fields = core.build_status_fields(777_777_777)
+
+    assert set(fields) == STATUS_KEYS
+    assert {
+        name: (field.dtype, field.shape) for name, field in fields.items()
+    } == STATUS_SCHEMA
+    assert {
+        name: field.tolist() for name, field in fields.items()
+    } == {
+        "status_sequence": [53],
+        "status_monotonic_ns": [777_777_777],
+        "source_epoch": [91],
+        "last_arm_command_id": [707],
+        "last_arm_target_epoch": [91],
+        "last_requested_arm_epoch": [0],
+        "accepted_arm_epoch": [0],
+        "producer_monotonic_ns": [666_666_640],
+        "newest_frame_index": [40],
+        "ready": [False],
+        "reference_window_ready": [True],
+        "source_stale": [False],
+        "ready_frames": [10],
+        "recovery_frames": [0],
+        "reason_code": [2],
+    }
 
 
 def test_status_sequence_increases_for_start_change_command_and_heartbeat():
