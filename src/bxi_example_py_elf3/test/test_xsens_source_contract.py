@@ -618,40 +618,107 @@ def test_status_fields_have_exact_shapes_dtypes_sentinels_and_ranges():
 
 
 def test_status_fields_preserve_exact_field_provenance():
-    core, clock = ready_core(91)
-    assert core.handle_arm_command(ArmCommand(707, 91, 0)) == (
+    disarmed, disarmed_clock = ready_core(91)
+    assert disarmed.handle_arm_command(ArmCommand(707, 91, 0)) == (
         ArmCommandResult(
             ArmCommandClassification.DISARMED, True, True, True
         )
     )
-    feed_stable_frames(core, clock, 10)
-    core._status_sequence = 52
+    feed_stable_frames(disarmed, disarmed_clock, 10)
+    disarmed._status_sequence = 52
 
-    fields = core.build_status_fields(777_777_777)
+    armed_mismatch, _ = ready_core(191)
+    assert armed_mismatch.handle_arm_command(
+        ArmCommand(808, 191, 191)
+    ) == ArmCommandResult(
+        ArmCommandClassification.ARMED, True, True, True
+    )
+    assert armed_mismatch.handle_arm_command(
+        ArmCommand(909, 190, 0)
+    ) == ArmCommandResult(
+        ArmCommandClassification.TARGET_MISMATCH, True, True, True
+    )
+    armed_mismatch._status_sequence = 60
 
-    assert set(fields) == STATUS_KEYS
-    assert {
-        name: (field.dtype, field.shape) for name, field in fields.items()
-    } == STATUS_SCHEMA
-    assert {
-        name: field.tolist() for name, field in fields.items()
-    } == {
-        "status_sequence": [53],
-        "status_monotonic_ns": [777_777_777],
-        "source_epoch": [91],
-        "last_arm_command_id": [707],
-        "last_arm_target_epoch": [91],
-        "last_requested_arm_epoch": [0],
-        "accepted_arm_epoch": [0],
-        "producer_monotonic_ns": [666_666_640],
-        "newest_frame_index": [40],
-        "ready": [False],
-        "reference_window_ready": [True],
-        "source_stale": [False],
-        "ready_frames": [10],
-        "recovery_frames": [0],
-        "reason_code": [2],
-    }
+    cases = (
+        (
+            "matching_disarm",
+            disarmed,
+            777_777_777,
+            {
+                "status_sequence": [53],
+                "status_monotonic_ns": [777_777_777],
+                "source_epoch": [91],
+                "last_arm_command_id": [707],
+                "last_arm_target_epoch": [91],
+                "last_requested_arm_epoch": [0],
+                "accepted_arm_epoch": [0],
+                "producer_monotonic_ns": [666_666_640],
+                "newest_frame_index": [40],
+                "ready": [False],
+                "reference_window_ready": [True],
+                "source_stale": [False],
+                "ready_frames": [10],
+                "recovery_frames": [0],
+                "reason_code": [2],
+            },
+        ),
+        (
+            "armed_with_mismatched_disarm",
+            armed_mismatch,
+            888_888_888,
+            {
+                "status_sequence": [61],
+                "status_monotonic_ns": [888_888_888],
+                "source_epoch": [191],
+                "last_arm_command_id": [909],
+                "last_arm_target_epoch": [190],
+                "last_requested_arm_epoch": [0],
+                "accepted_arm_epoch": [191],
+                "producer_monotonic_ns": [499_999_980],
+                "newest_frame_index": [30],
+                "ready": [True],
+                "reference_window_ready": [True],
+                "source_stale": [False],
+                "ready_frames": [30],
+                "recovery_frames": [0],
+                "reason_code": [9],
+            },
+        ),
+    )
+
+    for case_name, core, now_ns, expected in cases:
+        fields = core.build_status_fields(now_ns)
+        assert set(fields) == STATUS_KEYS, case_name
+        assert {
+            name: (field.dtype, field.shape)
+            for name, field in fields.items()
+        } == STATUS_SCHEMA, case_name
+        assert {
+            name: field.tolist() for name, field in fields.items()
+        } == expected, case_name
+
+    for same_dtype_names in (
+        (
+            "status_sequence",
+            "status_monotonic_ns",
+            "source_epoch",
+            "last_arm_command_id",
+            "last_arm_target_epoch",
+            "last_requested_arm_epoch",
+            "accepted_arm_epoch",
+            "producer_monotonic_ns",
+            "newest_frame_index",
+        ),
+        ("ready", "reference_window_ready", "source_stale"),
+        ("ready_frames", "recovery_frames", "reason_code"),
+    ):
+        for index, left_name in enumerate(same_dtype_names):
+            for right_name in same_dtype_names[index + 1:]:
+                assert any(
+                    expected[left_name] != expected[right_name]
+                    for _, _, _, expected in cases
+                ), (left_name, right_name)
 
 
 def test_status_sequence_increases_for_start_change_command_and_heartbeat():
