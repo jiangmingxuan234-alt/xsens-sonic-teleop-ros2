@@ -8404,44 +8404,13 @@ def test_live_source_states_have_no_direct_cross_routes(manifest):
     }
 
 
-def test_xsens_runbook_contains_exact_stream_settings_and_protocol_limit():
-    text = (MOD_ROOT / "XSENS_MVN.md").read_text(encoding="utf-8")
-    required = (
-        "UDP 127.0.0.1:9763",
-        "60 Hz",
-        "Position + Orientation (Quaternion)",
-        "one FullBody actor",
-        "23 segments",
-        "no props/fingers",
-        "pd_brake -> normal",
-        "first LT+RT+Y -> release -> READY",
-        "exact ACK/reference join",
-        "0.4 s blend",
-        "Same epoch outage: HOLD, no button, ten-frame joined auto-recovery.",
-        "New epoch: old HOLD, new READY, exact zero, one LT+RT+Y re-arm.",
-        "official MVN 2025 datagram/sample/time-code/wrap/playback-seek/"
-        "source-port semantics",
-        "stable session/take ID or restart signal outside MXTP02",
-        "standardized segment-frame meaning evidenced by the identity MVNX frame",
-        "whether quaternion representatives may flip sign",
-        "heading/origin setting effects on the global frame",
-        "metres plus wxyz for this streamer selection",
-        "BattleDragon LT axis 5, RT axis 4, Y button 4",
-        "CRSF CH7/CH3/CH8-Y threshold delivery",
-        "MXTP02 cannot detect a restart whose sender tuple, sample counter, "
-        "and usable time code all continue forward.",
-        "status_timeout_s=0.2 covers the local source/bridge heartbeat, "
-        "not MVN UDP spacing.",
-        "Keyboard hold/auto-repeat is unsupported.",
-        "r is absent from the default hardware launch.",
-    )
-    for literal in required:
-        assert literal in text
-    assert "/home/fazepurple/" not in text
-    assert "zhengbu_boy ceshi.mvnx" not in text
-    readme = (MOD_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "XSENS_MVN.md" in readme
 ```
+
+The runbook is human-facing documentation, so do not add a test that greps
+its prose or locks exact wording. Review `XSENS_MVN.md` and its README link
+against Step 4 during task review. Automated coverage in this task is for the
+machine-executable manifest, registration, routes, parameters, imports, and
+lifecycle behavior.
 
 Append this structural pre-change snapshot to
 `test/test_zerolab_manifest.py` before editing `mod.yaml`:
@@ -9018,8 +8987,10 @@ and proves recursive mod-file packaging includes all six `xsens/*.py` files.
 
 - [ ] **Step 4: Write the operator runbook and vendor hardening boundary**
 
-Write `XSENS_MVN.md` with these literal headings and contract lines (additional
-screenshots may be added later, but none are required):
+Write `XSENS_MVN.md` with the following headings and operational contract
+(wording may be improved without changing meaning; additional screenshots may
+be added later, but none are required). The task reviewer must compare the
+rendered runbook and README link to this section manually:
 
 ```markdown
 # Xsens MVN to SONIC operation
