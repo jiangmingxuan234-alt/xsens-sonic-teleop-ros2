@@ -6,9 +6,11 @@ import pytest
 from xsens.converter import XsensMotionConverter
 from xsens.source_core import (
     AcceptClassification,
+    TimeCodeMode,
     angular_deviation_degrees,
 )
 from xsens_test_helpers import (
+    SOURCE_PERIOD_NS,
     axis_angle_wxyz,
     feed_frame_sequence,
     feed_stable_frames,
@@ -96,6 +98,93 @@ def test_post_stale_output_and_readiness_refill_in_the_same_epoch():
     feed_stable_frames(core, clock, count=20)
     assert core.source_epoch == 91
     assert core.ready
+
+
+def test_stale_with_pending_candidate_preserves_same_epoch_source_state():
+    converter = XsensMotionConverter()
+    core, clock = make_core(converter=converter)
+    for offset in range(30):
+        clock.advance_ns(SOURCE_PERIOD_NS)
+        result = core.accept(
+            make_packet(
+                sample_counter=100 + offset,
+                time_code=1000 + offset,
+                receive_timestamp_ns=clock.now_ns,
+            )
+        )
+        assert result.accepted
+    assert core.ready
+    assert core.time_code_mode is TimeCodeMode.ADVANCING
+
+    clock.advance_ns(SOURCE_PERIOD_NS)
+    candidate = make_packet(
+        sample_counter=50,
+        time_code=500,
+        receive_timestamp_ns=clock.now_ns,
+    )
+    started = core.accept(candidate)
+    assert started.classification is AcceptClassification.CANDIDATE_STARTED
+    active_before = (
+        core.source_epoch,
+        core.locked_sender,
+        core._sample_counter,
+        core.newest_frame_index,
+        core.newest_producer_monotonic_ns,
+        core.time_code_mode,
+        core._time_code_probe,
+        core._trusted_time_code,
+    )
+    candidate_before = (
+        core.candidate_sender,
+        core._candidate_first_timestamp_ns,
+    )
+    stats_before = core.stats
+    continuity_before = converter.previous_raw_quats_xyzw
+    newest = core.newest_producer_monotonic_ns
+
+    assert not core.check_stale(newest + 500_000_000)
+    assert core.ready
+    assert core.check_stale(newest + 500_000_001)
+
+    assert core.ready_frames == 0
+    assert core.current_pose_window() is None
+    assert (
+        core.source_epoch,
+        core.locked_sender,
+        core._sample_counter,
+        core.newest_frame_index,
+        core.newest_producer_monotonic_ns,
+        core.time_code_mode,
+        core._time_code_probe,
+        core._trusted_time_code,
+    ) == active_before
+    assert (
+        core.candidate_sender,
+        core._candidate_first_timestamp_ns,
+    ) == candidate_before
+    assert core.candidate_frame_count == 1
+    assert core._candidate_packets[0] is candidate
+    assert core.stats == stats_before
+    np.testing.assert_array_equal(
+        converter.previous_raw_quats_xyzw, continuity_before
+    )
+
+    resumed = core.accept(
+        make_packet(
+            sample_counter=130,
+            time_code=1030,
+            receive_timestamp_ns=newest + 500_000_002,
+        )
+    )
+    assert resumed.classification is AcceptClassification.FORWARD
+    assert core.source_epoch == 91
+    assert core.locked_sender == ("127.0.0.1", 4000, 0)
+    assert core._sample_counter == 130
+    assert core.newest_frame_index == 130
+    assert core.time_code_mode is TimeCodeMode.ADVANCING
+    assert core._trusted_time_code == 1030
+    assert core.candidate_frame_count == 0
+    assert core.ready_frames == 1
 
 
 def test_approximate_neutral_need_not_match_t_pose():
@@ -394,3 +483,95 @@ def test_failed_conversion_rolls_back_readiness_and_output(monkeypatch):
     monkeypatch.setattr(converter, "convert", convert)
     feed_stable_frames(core, clock, 1)
     assert core.ready
+
+
+def test_failed_epoch_conversion_preserves_ready_evidence_and_window(
+    monkeypatch,
+):
+    converter = XsensMotionConverter()
+    core, clock = make_core(converter=converter)
+    positions = np.zeros((30, 23, 3), np.float32)
+    positions[:, 0, 0] = np.linspace(0.0, 0.14, 30, dtype=np.float32)
+    quats = np.tile(
+        np.array([1, 0, 0, 0], np.float32), (30, 23, 1)
+    )
+    feed_frame_sequence(core, clock, positions, quats)
+    assert core.ready
+
+    evidence_before = tuple(core._readiness_frames)
+    window_before = core.current_pose_window()
+    clock.advance_ns(1)
+    candidate = make_packet(
+        sample_counter=1,
+        time_code=0,
+        receive_timestamp_ns=clock.now_ns,
+    )
+    started = core.accept(candidate)
+    assert started.classification is AcceptClassification.CANDIDATE_STARTED
+    active_before = (
+        core.source_epoch,
+        core.locked_sender,
+        core._sample_counter,
+        core.newest_frame_index,
+        core.newest_producer_monotonic_ns,
+        core.time_code_mode,
+        core._time_code_probe,
+        core._trusted_time_code,
+        core.candidate_sender,
+        core._candidate_first_timestamp_ns,
+    )
+    stats_before = core.stats
+    continuity_before = converter.previous_raw_quats_xyzw
+
+    def fail_epoch_conversion(items, *, reset_epoch=False):
+        materialized = tuple(items)
+        assert reset_epoch is True
+        assert [frame_index for _, frame_index in materialized] == [1, 2]
+        raise RuntimeError("epoch FK failed")
+
+    monkeypatch.setattr(converter, "convert_many", fail_epoch_conversion)
+    clock.advance_ns(1)
+    failed = core.accept(
+        make_packet(
+            sample_counter=2,
+            time_code=0,
+            receive_timestamp_ns=clock.now_ns,
+        )
+    )
+
+    assert failed.classification is AcceptClassification.CONVERSION_REJECTED
+    assert core.ready
+    assert core.ready_frames == 30
+    assert [frame.frame_index for frame in evidence_before] == list(
+        range(1, 31)
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(core._readiness_frames, evidence_before)
+    )
+    window_after = core.current_pose_window()
+    assert [frame.frame_index for frame in window_after] == list(
+        range(21, 31)
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(window_after, window_before)
+    )
+    assert (
+        core.source_epoch,
+        core.locked_sender,
+        core._sample_counter,
+        core.newest_frame_index,
+        core.newest_producer_monotonic_ns,
+        core.time_code_mode,
+        core._time_code_probe,
+        core._trusted_time_code,
+        core.candidate_sender,
+        core._candidate_first_timestamp_ns,
+    ) == active_before
+    assert core.candidate_frame_count == 1
+    assert core._candidate_packets[0] is candidate
+    assert core.stats == replace(stats_before, conversion_failures=1)
+    np.testing.assert_array_equal(
+        converter.previous_raw_quats_xyzw, continuity_before
+    )
