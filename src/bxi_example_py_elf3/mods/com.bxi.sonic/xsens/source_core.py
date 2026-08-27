@@ -3,7 +3,7 @@
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from enum import Enum
+from enum import Enum, IntEnum
 import math
 import operator
 from threading import RLock
@@ -43,11 +43,43 @@ class AcceptClassification(str, Enum):
     CONVERSION_REJECTED = "conversion_rejected"
 
 
+class ArmCommandClassification(str, Enum):
+    ARMED = "armed"
+    DISARMED = "disarmed"
+    TARGET_MISMATCH = "target_mismatch"
+    NOT_READY = "not_ready"
+    DUPLICATE = "duplicate"
+    REUSED_ID = "reused_id"
+    INVALID = "invalid"
+
+
+class XsensReason(IntEnum):
+    NO_DATA = 0
+    COLLECTING_WINDOW = 1
+    COLLECTING_STABILITY = 2
+    PELVIS_UNSTABLE = 3
+    SEGMENT_UNSTABLE = 4
+    READY = 5
+    ARMED_FRESH = 6
+    ARMED_STALE = 7
+    ARMED_RECOVERING = 8
+    ARM_COMMAND_MISMATCH = 9
+    SESSION_RESET = 10
+    INVALID_INPUT = 11
+
+
 @dataclass(frozen=True)
 class CounterDelta:
     kind: CounterKind
     modular_delta: int
     missing_frames: int
+
+
+@dataclass(frozen=True)
+class ArmCommand:
+    command_id: int
+    target_source_epoch: int
+    requested_arm_epoch: int
 
 
 @dataclass(frozen=True)
@@ -57,6 +89,14 @@ class AcceptResult:
     epoch_changed: bool = False
     missing_frames: int = 0
     counter_kind: CounterKind | None = None
+
+
+@dataclass(frozen=True)
+class ArmCommandResult:
+    classification: ArmCommandClassification
+    first_seen: bool
+    receipt_changed: bool
+    publish_immediately: bool
 
 
 @dataclass(frozen=True)
@@ -73,12 +113,41 @@ class SourceCoreStats:
 
 
 def _integer_value(name: str, value) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, (bool, np.bool_)):
         raise ValueError(f"{name} must be an integer")
     try:
         return operator.index(value)
     except TypeError as error:
         raise ValueError(f"{name} must be an integer") from error
+
+
+def _signed_int64_input(name: str, value, *, minimum: int = 0) -> int:
+    integer = _integer_value(name, value)
+    if not minimum <= integer <= _MAX_SOURCE_EPOCH:
+        raise ValueError(
+            f"{name} must be in the range {minimum}..2**63-1"
+        )
+    return integer
+
+
+def _signed_int64_storage(name: str, value) -> int:
+    integer = _integer_value(name, value)
+    if not -(1 << 63) <= integer <= _MAX_SOURCE_EPOCH:
+        raise OverflowError(f"{name} does not fit signed int64 storage")
+    return integer
+
+
+def _immutable_array(values, dtype) -> np.ndarray:
+    contiguous = np.ascontiguousarray(values, dtype=dtype)
+    payload = bytes(bytearray(contiguous.tobytes() + b"\x00"))
+    immutable = np.frombuffer(
+        payload, dtype=dtype, count=contiguous.size
+    )
+    return immutable.reshape(contiguous.shape)
+
+
+def _immutable_scalar(value, dtype) -> np.ndarray:
+    return _immutable_array(np.array([value], dtype=dtype), dtype)
 
 
 def _uint32_value(name: str, value) -> int:
@@ -293,6 +362,17 @@ class XsensSourceCore:
             maxlen=ready_frames
         )
         self._stale_handled = False
+        self._accepted_arm_epoch = 0
+        self._seen_arm_commands: dict[int, tuple[int, int, int]] = {}
+        self._last_arm_command_id = 0
+        self._last_arm_target_epoch = 0
+        self._last_requested_arm_epoch = 0
+        self._armed_recovery_active = False
+        self._recovery_frames = 0
+        self._status_sequence = 0
+        self._invalid_input_pending = False
+        self._target_mismatch_pending = False
+        self._session_reset_pending = False
         self._stats = SourceCoreStats()
 
     @property
@@ -316,6 +396,11 @@ class XsensSourceCore:
             return self._newest_producer_monotonic_ns
 
     @property
+    def accepted_arm_epoch(self) -> int:
+        with self._lock:
+            return self._accepted_arm_epoch
+
+    @property
     def ready_frames(self) -> int:
         with self._lock:
             return len(self._readiness_frames)
@@ -323,9 +408,9 @@ class XsensSourceCore:
     @property
     def reference_window_ready(self) -> bool:
         with self._lock:
-            return len(self._output_frames) == self._window_frames
+            return self._window_is_complete_and_progressing()
 
-    def _readiness_is_stable(self) -> bool:
+    def _pelvis_is_stable(self) -> bool:
         pelvis_positions = np.stack(
             [
                 frame.segment_positions_xrt[0]
@@ -338,9 +423,9 @@ class XsensSourceCore:
         pelvis_diameter = np.sqrt(
             np.max(np.einsum("fgi,fgi->fg", pelvis_deltas, pelvis_deltas))
         )
-        if pelvis_diameter > self._max_pelvis_span_m:
-            return False
+        return bool(pelvis_diameter <= self._max_pelvis_span_m)
 
+    def _segments_are_stable(self) -> bool:
         segment_quaternions = np.stack(
             [
                 frame.segment_quat_xrt_xyzw
@@ -356,25 +441,50 @@ class XsensSourceCore:
             )
         )
 
+    def _readiness_is_stable(self) -> bool:
+        return self._pelvis_is_stable() and self._segments_are_stable()
+
+    def _source_is_stale(self, now_ns: int) -> bool:
+        return bool(
+            self._locked_sender is not None
+            and now_ns - self._newest_producer_monotonic_ns > self._stale_ns
+        )
+
+    def _window_is_complete_and_progressing(self) -> bool:
+        if len(self._output_frames) != self._window_frames:
+            return False
+        indices = [frame.frame_index for frame in self._output_frames]
+        return all(
+            right > left for left, right in zip(indices, indices[1:])
+        )
+
+    def _ready_at(self, now_ns: int) -> bool:
+        if self._source_is_stale(now_ns):
+            return False
+        if not self._window_is_complete_and_progressing():
+            return False
+        if self._accepted_arm_epoch == self._source_epoch:
+            return not self._armed_recovery_active
+        return bool(
+            len(self._readiness_frames) == self._ready_frames
+            and self._readiness_is_stable()
+        )
+
     @property
     def ready(self) -> bool:
         with self._lock:
-            return (
-                len(self._readiness_frames) == self._ready_frames
-                and len(self._output_frames) == self._window_frames
-                and self._readiness_is_stable()
-            )
+            return self._ready_at(_integer_value("clock_ns", self._clock_ns()))
 
     def current_pose_window(
         self,
     ) -> tuple[ConvertedXsensFrame, ...] | None:
         with self._lock:
-            if len(self._output_frames) != self._window_frames:
+            if not self._window_is_complete_and_progressing():
                 return None
             return tuple(self._output_frames)
 
     def check_stale(self, now_ns: int) -> bool:
-        """Clear unarmed readiness once on the strict producer-age edge."""
+        """Clear readiness once on the strict producer-age edge."""
         now = _integer_value("now_ns", now_ns)
         with self._lock:
             if (
@@ -386,8 +496,244 @@ class XsensSourceCore:
                 return False
             self._output_frames.clear()
             self._readiness_frames.clear()
+            self._armed_recovery_active = (
+                self._accepted_arm_epoch == self._source_epoch
+            )
+            self._recovery_frames = 0
             self._stale_handled = True
             return True
+
+    def note_invalid_input(self) -> None:
+        """Expose parser or transport rejection in the next status."""
+        with self._lock:
+            self._invalid_input_pending = True
+
+    def _normalize_arm_command(
+        self, command: ArmCommand
+    ) -> tuple[int, int, int]:
+        command_id = _signed_int64_input(
+            "command_id", command.command_id, minimum=1
+        )
+        target = _signed_int64_input(
+            "target_source_epoch",
+            command.target_source_epoch,
+            minimum=1,
+        )
+        requested = _signed_int64_input(
+            "requested_arm_epoch", command.requested_arm_epoch
+        )
+        if requested not in (0, target):
+            raise ValueError(
+                "requested_arm_epoch must be zero or target_source_epoch"
+            )
+        return command_id, target, requested
+
+    def _record_arm_receipt(
+        self, command_id: int, target: int, requested: int
+    ) -> None:
+        self._last_arm_command_id = command_id
+        self._last_arm_target_epoch = target
+        self._last_requested_arm_epoch = requested
+
+    def _clear_arm_receipt(self) -> None:
+        self._last_arm_command_id = 0
+        self._last_arm_target_epoch = 0
+        self._last_requested_arm_epoch = 0
+
+    def _clear_readiness_evidence(self) -> None:
+        self._output_frames.clear()
+        self._readiness_frames.clear()
+        self._armed_recovery_active = False
+        self._recovery_frames = 0
+
+    def handle_arm_command(
+        self, command: ArmCommand
+    ) -> ArmCommandResult:
+        """Validate and atomically apply one epoch-targeted arm command."""
+        try:
+            payload = self._normalize_arm_command(command)
+        except (AttributeError, ValueError):
+            self.note_invalid_input()
+            return ArmCommandResult(
+                ArmCommandClassification.INVALID, False, False, False
+            )
+
+        command_id, target, requested = payload
+        with self._lock:
+            seen = self._seen_arm_commands.get(command_id)
+            if seen == payload:
+                return ArmCommandResult(
+                    ArmCommandClassification.DUPLICATE,
+                    False,
+                    False,
+                    False,
+                )
+            if seen is not None:
+                self._invalid_input_pending = True
+                return ArmCommandResult(
+                    ArmCommandClassification.REUSED_ID,
+                    False,
+                    False,
+                    False,
+                )
+
+            target_mismatch = target != self._source_epoch
+            if target_mismatch:
+                classification = ArmCommandClassification.TARGET_MISMATCH
+            elif requested == 0:
+                classification = ArmCommandClassification.DISARMED
+            else:
+                now_ns = _integer_value("clock_ns", self._clock_ns())
+                if not self._ready_at(now_ns):
+                    classification = ArmCommandClassification.NOT_READY
+                else:
+                    classification = ArmCommandClassification.ARMED
+
+            self._seen_arm_commands[command_id] = payload
+            self._record_arm_receipt(command_id, target, requested)
+            self._target_mismatch_pending = target_mismatch
+            if classification is ArmCommandClassification.DISARMED:
+                self._accepted_arm_epoch = 0
+                self._clear_readiness_evidence()
+            elif classification is ArmCommandClassification.ARMED:
+                self._accepted_arm_epoch = self._source_epoch
+                self._armed_recovery_active = False
+                self._recovery_frames = 0
+            return ArmCommandResult(classification, True, True, True)
+
+    def _reason_at(self, now_ns: int) -> XsensReason:
+        if self._invalid_input_pending:
+            return XsensReason.INVALID_INPUT
+        if self._session_reset_pending:
+            return XsensReason.SESSION_RESET
+        if self._target_mismatch_pending:
+            return XsensReason.ARM_COMMAND_MISMATCH
+        if self._locked_sender is None:
+            return XsensReason.NO_DATA
+        if self._accepted_arm_epoch == self._source_epoch:
+            if self._source_is_stale(now_ns):
+                return XsensReason.ARMED_STALE
+            if (
+                self._armed_recovery_active
+                or not self._window_is_complete_and_progressing()
+            ):
+                return XsensReason.ARMED_RECOVERING
+            return XsensReason.ARMED_FRESH
+        if not self._window_is_complete_and_progressing():
+            return XsensReason.COLLECTING_WINDOW
+        if len(self._readiness_frames) < self._ready_frames:
+            return XsensReason.COLLECTING_STABILITY
+        if not self._pelvis_is_stable():
+            return XsensReason.PELVIS_UNSTABLE
+        if not self._segments_are_stable():
+            return XsensReason.SEGMENT_UNSTABLE
+        return XsensReason.READY
+
+    def build_pose_fields(self) -> dict[str, np.ndarray] | None:
+        """Build one immutable exact SONIC pose-window payload."""
+        now_ns = _integer_value("clock_ns", self._clock_ns())
+        with self._lock:
+            if (
+                self._source_is_stale(now_ns)
+                or self._armed_recovery_active
+                or not self._window_is_complete_and_progressing()
+            ):
+                return None
+            frames = tuple(self._output_frames)
+            indices = [
+                _signed_int64_storage("frame_index", frame.frame_index)
+                for frame in frames
+            ]
+            fields = {
+                "frame_index": _immutable_array(indices, np.int64),
+                "smpl_joints": _immutable_array(
+                    np.stack([frame.smpl_joints for frame in frames]),
+                    np.float32,
+                ),
+                "body_quat_w": _immutable_array(
+                    np.stack([frame.body_quat_w for frame in frames]),
+                    np.float32,
+                ),
+                "joint_pos": _immutable_array(
+                    np.stack([frame.joint_pos for frame in frames]),
+                    np.float32,
+                ),
+                "stream_mode": _immutable_scalar(1, np.int32),
+                "calibration_ready": _immutable_scalar(
+                    self._ready_at(now_ns), np.bool_
+                ),
+                "producer_monotonic_ns": _immutable_scalar(
+                    _signed_int64_storage(
+                        "producer_monotonic_ns",
+                        self._newest_producer_monotonic_ns,
+                    ),
+                    np.int64,
+                ),
+                "source_epoch": _immutable_scalar(
+                    self._source_epoch, np.int64
+                ),
+            }
+            return fields
+
+    def build_status_fields(self, now_ns: int) -> dict[str, np.ndarray]:
+        """Build one immutable exact status heartbeat and advance sequence."""
+        now = _signed_int64_input("now_ns", now_ns)
+        with self._lock:
+            if self._status_sequence >= _MAX_SOURCE_EPOCH:
+                raise OverflowError(
+                    "status_sequence exhausted signed int64 storage"
+                )
+            sequence = self._status_sequence + 1
+            newest = _signed_int64_storage(
+                "newest_frame_index", self._newest_frame_index
+            )
+            producer = _signed_int64_storage(
+                "producer_monotonic_ns",
+                self._newest_producer_monotonic_ns,
+            )
+            ready = self._ready_at(now)
+            window_ready = self._window_is_complete_and_progressing()
+            stale = self._source_is_stale(now)
+            reason = self._reason_at(now)
+            fields = {
+                "status_sequence": _immutable_scalar(sequence, np.int64),
+                "status_monotonic_ns": _immutable_scalar(now, np.int64),
+                "source_epoch": _immutable_scalar(
+                    self._source_epoch, np.int64
+                ),
+                "last_arm_command_id": _immutable_scalar(
+                    self._last_arm_command_id, np.int64
+                ),
+                "last_arm_target_epoch": _immutable_scalar(
+                    self._last_arm_target_epoch, np.int64
+                ),
+                "last_requested_arm_epoch": _immutable_scalar(
+                    self._last_requested_arm_epoch, np.int64
+                ),
+                "accepted_arm_epoch": _immutable_scalar(
+                    self._accepted_arm_epoch, np.int64
+                ),
+                "producer_monotonic_ns": _immutable_scalar(
+                    producer, np.int64
+                ),
+                "newest_frame_index": _immutable_scalar(
+                    newest, np.int64
+                ),
+                "ready": _immutable_scalar(ready, np.bool_),
+                "reference_window_ready": _immutable_scalar(
+                    window_ready, np.bool_
+                ),
+                "source_stale": _immutable_scalar(stale, np.bool_),
+                "ready_frames": _immutable_scalar(
+                    len(self._readiness_frames), np.int32
+                ),
+                "recovery_frames": _immutable_scalar(
+                    self._recovery_frames, np.int32
+                ),
+                "reason_code": _immutable_scalar(reason, np.int32),
+            }
+            self._status_sequence = sequence
+            return fields
 
     @property
     def time_code_mode(self) -> TimeCodeMode:
@@ -457,9 +803,16 @@ class XsensSourceCore:
     def _append_accepted_frame(self, frame: ConvertedXsensFrame) -> None:
         self._output_frames.append(frame)
         self._readiness_frames.append(frame)
+        if self._armed_recovery_active:
+            self._recovery_frames = min(
+                len(self._output_frames), self._same_epoch_resume_frames
+            )
+            if self._recovery_frames == self._same_epoch_resume_frames:
+                self._armed_recovery_active = False
         self._stale_handled = False
 
     def _conversion_rejected(self) -> AcceptResult:
+        self._invalid_input_pending = True
         self._bump_stats(conversion_failures=1)
         return AcceptResult(
             accepted=False,
@@ -492,6 +845,7 @@ class XsensSourceCore:
         self._trusted_time_code = trusted
         self._clear_candidate()
         self._append_accepted_frame(frame)
+        self._invalid_input_pending = False
         self._bump_stats(accepted=1)
         return AcceptResult(
             accepted=True,
@@ -529,6 +883,8 @@ class XsensSourceCore:
         self._trusted_time_code = trusted
         self._clear_candidate()
         self._append_accepted_frame(frame)
+        self._invalid_input_pending = False
+        self._session_reset_pending = False
         self._bump_stats(
             accepted=1,
             inferred_missing_frames=counter_delta.missing_frames,
@@ -627,10 +983,14 @@ class XsensSourceCore:
         self._time_code_probe = probe
         self._trusted_time_code = trusted
         self._clear_candidate()
-        self._output_frames.clear()
-        self._readiness_frames.clear()
+        self._accepted_arm_epoch = 0
+        self._clear_arm_receipt()
+        self._target_mismatch_pending = False
+        self._clear_readiness_evidence()
         for frame in frames:
             self._append_accepted_frame(frame)
+        self._invalid_input_pending = False
+        self._session_reset_pending = True
         self._bump_stats(
             accepted=len(frames),
             epoch_changes=1,
@@ -744,10 +1104,14 @@ class XsensSourceCore:
 __all__ = [
     "AcceptClassification",
     "AcceptResult",
+    "ArmCommand",
+    "ArmCommandClassification",
+    "ArmCommandResult",
     "CounterDelta",
     "CounterKind",
     "SourceCoreStats",
     "TimeCodeMode",
+    "XsensReason",
     "XsensSourceCore",
     "angular_deviation_degrees",
     "classify_uint32_delta",

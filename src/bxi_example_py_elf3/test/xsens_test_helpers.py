@@ -259,6 +259,98 @@ def ready_core(epoch):
     return core, clock
 
 
+def make_xsens_pose_fields(
+    *,
+    indices=None,
+    source_epoch=71,
+    calibration_ready=True,
+    producer_monotonic_ns=1_000_000_000,
+):
+    frame_index = (
+        np.arange(100, 110, dtype=np.int64)
+        if indices is None
+        else np.asarray(indices, dtype=np.int64)
+    )
+    rows = int(frame_index.size)
+    roots = np.zeros((rows, 4), dtype=np.float32)
+    roots[:, 0] = 1.0
+    return {
+        "frame_index": frame_index,
+        "smpl_joints": np.zeros((rows, 24, 3), dtype=np.float32),
+        "body_quat_w": roots,
+        "joint_pos": np.zeros((rows, 29), dtype=np.float32),
+        "stream_mode": np.array([1], dtype=np.int32),
+        "calibration_ready": np.array(
+            [calibration_ready], dtype=np.bool_
+        ),
+        "producer_monotonic_ns": np.array(
+            [producer_monotonic_ns], dtype=np.int64
+        ),
+        "source_epoch": np.array([source_epoch], dtype=np.int64),
+    }
+
+
+def make_status(
+    *,
+    status_sequence=1,
+    status_monotonic_ns=1_000_000_000,
+    source_epoch=71,
+    last_arm_command_id=0,
+    last_arm_target_epoch=0,
+    last_requested_arm_epoch=0,
+    accepted_arm_epoch=0,
+    producer_monotonic_ns=1_000_000_000,
+    newest_frame_index=109,
+    ready=True,
+    reference_window_ready=True,
+    source_stale=False,
+    ready_frames=30,
+    recovery_frames=0,
+    reason_code=None,
+):
+    from xsens.source_core import XsensReason
+
+    if reason_code is None:
+        reason_code = XsensReason.READY
+    return {
+        "status_sequence": np.array(
+            [status_sequence], dtype=np.int64
+        ),
+        "status_monotonic_ns": np.array(
+            [status_monotonic_ns], dtype=np.int64
+        ),
+        "source_epoch": np.array([source_epoch], dtype=np.int64),
+        "last_arm_command_id": np.array(
+            [last_arm_command_id], dtype=np.int64
+        ),
+        "last_arm_target_epoch": np.array(
+            [last_arm_target_epoch], dtype=np.int64
+        ),
+        "last_requested_arm_epoch": np.array(
+            [last_requested_arm_epoch], dtype=np.int64
+        ),
+        "accepted_arm_epoch": np.array(
+            [accepted_arm_epoch], dtype=np.int64
+        ),
+        "producer_monotonic_ns": np.array(
+            [producer_monotonic_ns], dtype=np.int64
+        ),
+        "newest_frame_index": np.array(
+            [newest_frame_index], dtype=np.int64
+        ),
+        "ready": np.array([ready], dtype=np.bool_),
+        "reference_window_ready": np.array(
+            [reference_window_ready], dtype=np.bool_
+        ),
+        "source_stale": np.array([source_stale], dtype=np.bool_),
+        "ready_frames": np.array([ready_frames], dtype=np.int32),
+        "recovery_frames": np.array(
+            [recovery_frames], dtype=np.int32
+        ),
+        "reason_code": np.array([int(reason_code)], dtype=np.int32),
+    }
+
+
 def axis_angle_wxyz(axis: int, degrees: float) -> np.ndarray:
     value = np.zeros(4, dtype=np.float32)
     value[0] = np.cos(np.deg2rad(degrees) / 2.0)
