@@ -1,8 +1,16 @@
+from __future__ import annotations
+
 from collections import deque
 import socket
 import struct
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+
+if TYPE_CHECKING:
+    from xsens.converter import XsensMotionConverter
+    from xsens.source_core import XsensSourceCore
 
 
 class FakeClock:
@@ -136,4 +144,57 @@ def make_packet(
         payload,
         receive_timestamp_ns=receive_timestamp_ns,
         sender_address=sender,
+    )
+
+
+def make_core(
+    *,
+    epoch_draws: tuple[int, ...] = (91, 92, 93),
+    converter: XsensMotionConverter | None = None,
+    now_ns: int = 0,
+    window_frames: int = 10,
+    same_epoch_resume_frames: int = 10,
+    ready_frames: int = 30,
+    stale_seconds: float = 0.5,
+    epoch_candidate_frames: int = 2,
+    epoch_candidate_timeout_s: float = 0.25,
+    max_pelvis_span_m: float = 0.15,
+    max_segment_deviation_deg: float = 20.0,
+) -> tuple[XsensSourceCore, FakeClock]:
+    from xsens.converter import XsensMotionConverter
+    from xsens.source_core import XsensSourceCore
+
+    clock = FakeClock(now_ns)
+    draws = iter(epoch_draws)
+    core = XsensSourceCore(
+        converter or XsensMotionConverter(),
+        clock_ns=clock.monotonic_ns,
+        epoch_factory=lambda: next(draws),
+        window_frames=window_frames,
+        same_epoch_resume_frames=same_epoch_resume_frames,
+        ready_frames=ready_frames,
+        stale_seconds=stale_seconds,
+        epoch_candidate_frames=epoch_candidate_frames,
+        epoch_candidate_timeout_s=epoch_candidate_timeout_s,
+        max_pelvis_span_m=max_pelvis_span_m,
+        max_segment_deviation_deg=max_segment_deviation_deg,
+    )
+    return core, clock
+
+
+def accept_packet(
+    core,
+    counter,
+    *,
+    timestamp_ns,
+    time_code=0,
+    sender=("127.0.0.1", 4000),
+):
+    return core.accept(
+        make_packet(
+            sample_counter=counter,
+            time_code=time_code,
+            sender=sender,
+            receive_timestamp_ns=timestamp_ns,
+        )
     )
