@@ -13,16 +13,45 @@ from xsens.protocol import (
 from xsens_test_helpers import build_mxtp02_packet
 
 
+DISTINCT_VALID_QUATERNIONS = np.array(
+    [
+        [0.960, 0.001, -0.002, 0.002],
+        [0.961, 0.002, -0.003, 0.004],
+        [0.962, 0.003, -0.004, 0.006],
+        [0.963, 0.004, -0.005, 0.008],
+        [0.964, 0.005, -0.006, 0.010],
+        [0.965, 0.006, -0.007, 0.012],
+        [0.966, 0.007, -0.008, 0.014],
+        [0.967, 0.008, -0.009, 0.016],
+        [0.968, 0.009, -0.010, 0.018],
+        [0.969, 0.010, -0.011, 0.020],
+        [0.970, 0.011, -0.012, 0.022],
+        [0.971, 0.012, -0.013, 0.024],
+        [0.972, 0.013, -0.014, 0.026],
+        [0.973, 0.014, -0.015, 0.028],
+        [0.974, 0.015, -0.016, 0.030],
+        [0.975, 0.016, -0.017, 0.032],
+        [0.976, 0.017, -0.018, 0.034],
+        [0.977, 0.018, -0.019, 0.036],
+        [0.978, 0.019, -0.020, 0.038],
+        [0.979, 0.020, -0.021, 0.040],
+        [0.980, 0.021, -0.022, 0.042],
+        [0.981, 0.022, -0.023, 0.044],
+        [0.982, 0.023, -0.024, 0.046],
+    ],
+    dtype=np.float32,
+)
+
+
 def test_decodes_all_header_metadata_and_freezes_arrays():
     positions = np.arange(69, dtype=np.float32).reshape(23, 3) / 10.0
-    quats = np.tile(np.array([1, 0, 0, 0], np.float32), (23, 1))
     payload = build_mxtp02_packet(
-        sample_counter=0x01020304,
-        time_code=0x11223344,
-        datagram_counter=7,
-        reserved=0x1234,
+        sample_counter=0xFEDCBA98,
+        time_code=0x89ABCDEF,
+        datagram_counter=0xFE,
+        reserved=0xFEDC,
         positions=positions,
-        quaternions_wxyz=quats,
+        quaternions_wxyz=DISTINCT_VALID_QUATERNIONS,
     )
     packet = parse_mxtp02_packet(
         payload,
@@ -36,22 +65,24 @@ def test_decodes_all_header_metadata_and_freezes_arrays():
         23,
     )
     assert packet.header == Mxtp02Header(
-        sample_counter=0x01020304,
-        datagram_counter=7,
+        sample_counter=0xFEDCBA98,
+        datagram_counter=0xFE,
         item_count=23,
-        time_code=0x11223344,
+        time_code=0x89ABCDEF,
         character_id=0,
         body_segment_count=23,
         prop_count=0,
         finger_segment_count=0,
-        reserved=0x1234,
+        reserved=0xFEDC,
         payload_size=736,
     )
     assert packet.receive_timestamp_ns == 987_654_321
     assert packet.sender_address == ("127.0.0.1", 43123)
     assert packet.raw_payload == payload
     np.testing.assert_array_equal(packet.segment_positions_xsens, positions)
-    np.testing.assert_array_equal(packet.segment_quat_wxyz_xsens, quats)
+    np.testing.assert_array_equal(
+        packet.segment_quat_wxyz_xsens, DISTINCT_VALID_QUATERNIONS
+    )
     assert packet.segment_positions_xsens.dtype == np.float32
     assert packet.segment_quat_wxyz_xsens.dtype == np.float32
     assert packet.segment_positions_xsens.shape == (23, 3)
@@ -64,18 +95,19 @@ def test_decodes_all_header_metadata_and_freezes_arrays():
 
 def test_segment_rows_are_id_indexed_independent_of_arrival_order():
     positions = np.arange(69, dtype=np.float32).reshape(23, 3)
-    quats = np.tile(np.array([1, 0, 0, 0], np.float32), (23, 1))
     packet = parse_mxtp02_packet(
         build_mxtp02_packet(
             segment_order=tuple(reversed(range(1, 24))),
             positions=positions,
-            quaternions_wxyz=quats,
+            quaternions_wxyz=DISTINCT_VALID_QUATERNIONS,
         ),
         receive_timestamp_ns=1,
         sender_address=("127.0.0.1", 4000),
     )
     np.testing.assert_array_equal(packet.segment_positions_xsens, positions)
-    np.testing.assert_array_equal(packet.segment_quat_wxyz_xsens, quats)
+    np.testing.assert_array_equal(
+        packet.segment_quat_wxyz_xsens, DISTINCT_VALID_QUATERNIONS
+    )
 
 
 @pytest.mark.parametrize(
@@ -123,7 +155,12 @@ def test_rejects_nonfinite_position_or_quaternion(bad):
 
 
 def test_norm_boundaries_are_closed_at_float32_wire_precision():
-    for accepted in (np.float32(0.95), np.float32(1.05)):
+    for accepted in (
+        np.nextafter(np.float32(0.95), np.float32(-np.inf)),
+        np.float32(0.95),
+        np.float32(1.05),
+        np.nextafter(np.float32(1.05), np.float32(np.inf)),
+    ):
         quats = np.zeros((23, 4), dtype=np.float32)
         quats[:, 0] = accepted
         parse_mxtp02_packet(
