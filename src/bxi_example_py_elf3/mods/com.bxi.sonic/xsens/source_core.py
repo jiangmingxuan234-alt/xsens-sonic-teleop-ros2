@@ -8,6 +8,8 @@ import math
 import operator
 from threading import RLock
 
+import numpy as np
+
 from .converter import ConvertedXsensFrame, XsensMotionConverter
 from .protocol import XsensPacket
 
@@ -187,6 +189,21 @@ def _next_time_code_state(
     return mode, current, trusted
 
 
+def angular_deviation_degrees(samples_xyzw: np.ndarray) -> np.ndarray:
+    """Measure each quaternion sample from its aligned segment mean."""
+    aligned = np.asarray(samples_xyzw, dtype=np.float64).copy()
+    aligned /= np.linalg.norm(aligned, axis=2, keepdims=True)
+    aligned[
+        np.einsum("fsc,sc->fs", aligned, aligned[0]) < 0.0
+    ] *= -1.0
+    mean = aligned.mean(axis=0)
+    mean /= np.linalg.norm(mean, axis=1, keepdims=True)
+    dots = np.abs(np.einsum("fsc,sc->fs", aligned, mean))
+    return np.degrees(
+        2.0 * np.arccos(np.clip(dots, 0.0, 1.0))
+    )
+
+
 class XsensSourceCore:
     """Classify parser-valid packets and commit observable source epochs."""
 
@@ -255,7 +272,7 @@ class XsensSourceCore:
         self._epoch_candidate_timeout_ns = int(
             epoch_candidate_timeout_s * _NANOSECONDS_PER_SECOND
         )
-        self._max_pelvis_span_m = max_pelvis_span_m
+        self._max_pelvis_span_m = np.float32(max_pelvis_span_m)
         self._max_segment_deviation_deg = max_segment_deviation_deg
 
         self._source_epoch = draw_new_epoch(epoch_factory)
@@ -275,6 +292,7 @@ class XsensSourceCore:
         self._readiness_frames: deque[ConvertedXsensFrame] = deque(
             maxlen=ready_frames
         )
+        self._stale_handled = False
         self._stats = SourceCoreStats()
 
     @property
@@ -296,6 +314,80 @@ class XsensSourceCore:
     def newest_producer_monotonic_ns(self) -> int:
         with self._lock:
             return self._newest_producer_monotonic_ns
+
+    @property
+    def ready_frames(self) -> int:
+        with self._lock:
+            return len(self._readiness_frames)
+
+    @property
+    def reference_window_ready(self) -> bool:
+        with self._lock:
+            return len(self._output_frames) == self._window_frames
+
+    def _readiness_is_stable(self) -> bool:
+        pelvis_positions = np.stack(
+            [
+                frame.segment_positions_xrt[0]
+                for frame in self._readiness_frames
+            ]
+        )
+        pelvis_deltas = (
+            pelvis_positions[:, None, :] - pelvis_positions[None, :, :]
+        )
+        pelvis_diameter = np.sqrt(
+            np.max(np.einsum("fgi,fgi->fg", pelvis_deltas, pelvis_deltas))
+        )
+        if pelvis_diameter > self._max_pelvis_span_m:
+            return False
+
+        segment_quaternions = np.stack(
+            [
+                frame.segment_quat_xrt_xyzw
+                for frame in self._readiness_frames
+            ]
+        )
+        deviations = angular_deviation_degrees(segment_quaternions)
+        segment_p95 = np.percentile(deviations, 95.0, axis=0)
+        return bool(
+            np.all(
+                segment_p95
+                <= self._max_segment_deviation_deg + 1e-5
+            )
+        )
+
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return (
+                len(self._readiness_frames) == self._ready_frames
+                and len(self._output_frames) == self._window_frames
+                and self._readiness_is_stable()
+            )
+
+    def current_pose_window(
+        self,
+    ) -> tuple[ConvertedXsensFrame, ...] | None:
+        with self._lock:
+            if len(self._output_frames) != self._window_frames:
+                return None
+            return tuple(self._output_frames)
+
+    def check_stale(self, now_ns: int) -> bool:
+        """Clear unarmed readiness once on the strict producer-age edge."""
+        now = _integer_value("now_ns", now_ns)
+        with self._lock:
+            if (
+                self._locked_sender is None
+                or self._stale_handled
+                or now - self._newest_producer_monotonic_ns
+                <= self._stale_ns
+            ):
+                return False
+            self._output_frames.clear()
+            self._readiness_frames.clear()
+            self._stale_handled = True
+            return True
 
     @property
     def time_code_mode(self) -> TimeCodeMode:
@@ -365,6 +457,7 @@ class XsensSourceCore:
     def _append_accepted_frame(self, frame: ConvertedXsensFrame) -> None:
         self._output_frames.append(frame)
         self._readiness_frames.append(frame)
+        self._stale_handled = False
 
     def _conversion_rejected(self) -> AcceptResult:
         self._bump_stats(conversion_failures=1)
@@ -656,6 +749,7 @@ __all__ = [
     "SourceCoreStats",
     "TimeCodeMode",
     "XsensSourceCore",
+    "angular_deviation_degrees",
     "classify_uint32_delta",
     "draw_new_epoch",
 ]

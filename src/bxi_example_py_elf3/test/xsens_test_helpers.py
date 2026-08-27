@@ -14,6 +14,9 @@ if TYPE_CHECKING:
     from xsens.source_core import XsensSourceCore
 
 
+SOURCE_PERIOD_NS = 1_000_000_000 // 60
+
+
 class FakeClock:
     def __init__(self, now_ns: int = 0) -> None:
         self.now_ns = int(now_ns)
@@ -203,3 +206,61 @@ def accept_packet(
         header=replace(packet.header, character_id=character_id),
     )
     return core.accept(packet)
+
+
+def feed_frame_sequence(
+    core, clock, positions, quaternions, *, counter_start=None
+):
+    count = len(positions)
+    assert len(quaternions) == count
+    if counter_start is None:
+        counter_start = (
+            1
+            if core.newest_frame_index < 0
+            else (core.newest_frame_index + 1) & 0xFFFFFFFF
+        )
+    results = []
+    for offset, (position, quat) in enumerate(
+        zip(positions, quaternions)
+    ):
+        clock.advance_ns(SOURCE_PERIOD_NS)
+        results.append(
+            core.accept(
+                make_packet(
+                    sample_counter=(counter_start + offset) & 0xFFFFFFFF,
+                    time_code=0,
+                    receive_timestamp_ns=clock.now_ns,
+                    positions=position,
+                    quaternions_wxyz=quat,
+                )
+            )
+        )
+    return results
+
+
+def feed_stable_frames(core, clock, count, epoch_counter_start=None):
+    positions = np.zeros((count, 23, 3), dtype=np.float32)
+    quats = np.tile(
+        np.array([1, 0, 0, 0], dtype=np.float32), (count, 23, 1)
+    )
+    return feed_frame_sequence(
+        core,
+        clock,
+        positions,
+        quats,
+        counter_start=epoch_counter_start,
+    )
+
+
+def ready_core(epoch):
+    core, clock = make_core(epoch_draws=(epoch, epoch + 1))
+    feed_stable_frames(core, clock, 30)
+    assert core.source_epoch == epoch and core.ready
+    return core, clock
+
+
+def axis_angle_wxyz(axis: int, degrees: float) -> np.ndarray:
+    value = np.zeros(4, dtype=np.float32)
+    value[0] = np.cos(np.deg2rad(degrees) / 2.0)
+    value[axis + 1] = np.sin(np.deg2rad(degrees) / 2.0)
+    return value
