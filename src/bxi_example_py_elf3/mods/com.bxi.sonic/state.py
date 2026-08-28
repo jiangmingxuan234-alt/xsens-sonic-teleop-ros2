@@ -844,7 +844,13 @@ class XsensSonicTeleopState(SonicTeleopState):
 
     @staticmethod
     def _runtime_exact_zero(value: object) -> bool:
-        if isinstance(value, bool):
+        if (
+            isinstance(value, bool)
+            or (
+                isinstance(value, np.generic)
+                and np.issubdtype(value.dtype, np.bool_)
+            )
+        ):
             return False
         try:
             return operator.index(value) == 0

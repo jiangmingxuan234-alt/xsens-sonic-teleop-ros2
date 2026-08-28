@@ -410,6 +410,15 @@ def test_entry_runtime_slot_accepts_integer_protocol_zero(state_types, value):
         harness.close()
 
 
+def test_entry_runtime_slot_rejects_numpy_boolean_zero(state_types):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(np.bool_(False))
+        assert not harness.state.neutral_latch_open
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize(
     "value",
     [False, True, 0.0, -0.0, 1, -1, np.int64(1), IntegerProtocolValue(1)],
@@ -442,6 +451,16 @@ def test_observed_runtime_slot_accepts_integer_protocol_zero(
         harness.close()
 
 
+def test_observed_runtime_slot_rejects_numpy_boolean_zero(state_types):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(11)
+        harness.observe_slot(np.bool_(False))
+        assert not harness.state.neutral_latch_open
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize("value", [False, 0.0, -0.0])
 def test_false_or_float_zero_slot_cannot_issue_ready_arm(state_types, value):
     harness = StateHarness(state_types)
@@ -456,6 +475,22 @@ def test_false_or_float_zero_slot_cannot_issue_ready_arm(state_types, value):
             [101, 71, 0],
         ]
         assert harness.command_count() == before
+        assert not harness.state.arm_pending
+    finally:
+        harness.close()
+
+
+def test_numpy_boolean_zero_slot_cannot_issue_ready_arm(state_types):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(11)
+        harness.make_ready(epoch=71, status_sequence=20, newest_frame=109)
+        harness.observe_slot(np.bool_(False))
+        harness.set_slot(11)
+        assert harness.state.on_action(harness.ctx, "activate_xsens")
+        assert [message.data for message in harness.published_commands] == [
+            [101, 71, 0],
+        ]
         assert not harness.state.arm_pending
     finally:
         harness.close()
