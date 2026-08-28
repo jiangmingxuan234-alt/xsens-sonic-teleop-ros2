@@ -450,6 +450,248 @@ def test_status_and_reference_queues_do_not_overwrite_each_other(policy):
     assert snapshot.reference.source_newest_frame_index == 120
 
 
+@pytest.mark.parametrize(
+    ("reference_topic", "status_topic"),
+    [
+        ("", "xsens_status"),
+        ("smpl_ref", ""),
+        (None, "xsens_status"),
+        ("smpl_ref", None),
+        (7, "xsens_status"),
+        ("smpl_ref", 7),
+        ("same", "same"),
+        ("smpl", "smpl_ref"),
+        ("smpl_ref", "smpl"),
+    ],
+)
+def test_unsafe_topics_are_rejected_before_resource_construction(
+    reference_topic,
+    status_topic,
+):
+    with pytest.raises(ValueError, match="topics"):
+        SonicTeleopPolicy(
+            "definitely-missing.onnx",
+            "definitely-missing.npz",
+            use_smpl_ref_zmq=False,
+            smpl_ref_zmq_topic=reference_topic,
+            xsens_status_zmq_topic=status_topic,
+        )
+
+
+def test_real_message_classifier_routes_default_topics_to_separate_snapshots(
+    policy,
+):
+    reference = make_reference(epoch=71, newest_frame=110)
+    reference_fields = {
+        "term1_local": reference.term1_local,
+        "root_quat": reference.root_quat,
+        "wrist": reference.wrist,
+        "frame_index": np.array([reference.frame_index], np.int64),
+        "source_ready": np.array([reference.source_ready], np.bool_),
+        "producer_monotonic_ns": np.array(
+            [reference.producer_monotonic_ns], np.int64
+        ),
+        "source_epoch": np.array([reference.source_epoch], np.int64),
+        "source_newest_frame_index": np.array(
+            [reference.source_newest_frame_index], np.int64
+        ),
+    }
+    policy._append_source_message(
+        pack_pose_message(
+            make_status(status_sequence=11, source_epoch=71),
+            topic=policy.xsens_status_zmq_topic,
+        ),
+        1.0,
+    )
+    policy._append_source_message(
+        pack_pose_message(
+            reference_fields,
+            topic=policy.smpl_ref_zmq_topic,
+        ),
+        1.0,
+    )
+
+    snapshot = policy.poll_source_snapshot()
+
+    assert snapshot.status.status_sequence == 11
+    assert snapshot.reference.source_newest_frame_index == 110
+
+
+def test_same_batch_newer_then_older_reference_retains_newest_progress(
+    policy,
+):
+    policy.inject_reference(make_reference(epoch=71, newest_frame=110))
+    policy.poll_source_snapshot()
+    policy.inject_reference(make_reference(epoch=71, newest_frame=111))
+    policy.inject_reference(make_reference(epoch=71, newest_frame=110))
+
+    snapshot = policy.poll_source_snapshot()
+
+    assert snapshot.reference.source_epoch == 71
+    assert snapshot.reference.source_newest_frame_index == 111
+
+
+def test_cross_poll_older_reference_cannot_replace_newer_same_epoch(policy):
+    policy.inject_reference(make_reference(epoch=71, newest_frame=111))
+    policy.poll_source_snapshot()
+    policy.inject_reference(make_reference(epoch=71, newest_frame=110))
+
+    snapshot = policy.poll_source_snapshot()
+
+    assert snapshot.reference.source_epoch == 71
+    assert snapshot.reference.source_newest_frame_index == 111
+
+
+def test_same_batch_and_cross_poll_status_sequence_rollback_is_ignored(
+    policy,
+):
+    policy.inject_status(make_status(
+        status_sequence=12, source_epoch=71, newest_frame_index=111,
+    ))
+    policy.inject_status(make_status(
+        status_sequence=11, source_epoch=71, newest_frame_index=111,
+    ))
+    snapshot = policy.poll_source_snapshot()
+    assert snapshot.status.status_sequence == 12
+
+    policy.inject_status(make_status(
+        status_sequence=10, source_epoch=71, newest_frame_index=111,
+    ))
+    snapshot = policy.poll_source_snapshot()
+
+    assert snapshot.status.status_sequence == 12
+    assert snapshot.status.newest_frame_index == 111
+
+
+def test_same_epoch_status_cannot_regress_cached_frame_progress(policy):
+    policy.inject_status(make_status(
+        status_sequence=11, source_epoch=71, newest_frame_index=111,
+    ))
+    policy.poll_source_snapshot()
+    policy.inject_status(make_status(
+        status_sequence=12, source_epoch=71, newest_frame_index=110,
+    ))
+
+    snapshot = policy.poll_source_snapshot()
+
+    assert snapshot.status.status_sequence == 11
+    assert snapshot.status.newest_frame_index == 111
+
+
+def test_malformed_messages_do_not_lower_status_or_reference_watermarks(
+    policy,
+):
+    policy.inject_status(make_status(
+        status_sequence=12, source_epoch=71, newest_frame_index=111,
+    ))
+    policy.inject_reference(make_reference(epoch=71, newest_frame=111))
+    policy.poll_source_snapshot()
+
+    malformed_status = make_status(
+        status_sequence=13, source_epoch=71, newest_frame_index=112,
+    )
+    malformed_status["ready"] = np.array([1], dtype=np.int32)
+    policy.inject_status(malformed_status)
+    policy.inject_status(make_status(
+        status_sequence=11, source_epoch=71, newest_frame_index=110,
+    ))
+    policy.inject_reference(replace(
+        make_reference(epoch=71, newest_frame=112),
+        root_quat=np.zeros((10, 4), dtype=np.float32),
+    ))
+    policy.inject_reference(make_reference(epoch=71, newest_frame=110))
+
+    snapshot = policy.poll_source_snapshot()
+
+    assert snapshot.status.status_sequence == 12
+    assert snapshot.status.newest_frame_index == 111
+    assert snapshot.reference.source_newest_frame_index == 111
+
+
+def test_consumed_reference_progress_rejects_same_epoch_inference_replay(
+    policy_harness,
+):
+    policy = policy_harness.policy
+    authorize_reference(policy, make_reference(
+        epoch=71, newest_frame=110, row_marker=1.0,
+    ))
+    policy_harness.step()
+    assert policy.input_buffer[0, 0] == pytest.approx(1.0)
+
+    policy.inject_status(make_status(
+        status_sequence=12, source_epoch=71, last_arm_command_id=7,
+        last_arm_target_epoch=71, last_requested_arm_epoch=71,
+        accepted_arm_epoch=71, newest_frame_index=111,
+    ))
+    policy.inject_reference(make_reference(
+        epoch=71, newest_frame=111, row_marker=2.0,
+    ))
+    policy_harness.step()
+    assert policy.input_buffer[0, 0] == pytest.approx(2.0)
+
+    policy.inject_status(make_status(
+        status_sequence=13, source_epoch=71, last_arm_command_id=7,
+        last_arm_target_epoch=71, last_requested_arm_epoch=71,
+        accepted_arm_epoch=71, newest_frame_index=111,
+    ))
+    policy.inject_reference(make_reference(
+        epoch=71, newest_frame=110, row_marker=3.0,
+    ))
+    policy_harness.step()
+
+    assert policy.live_reference_gate_open
+    assert policy.input_buffer[0, 0] == pytest.approx(2.0)
+    assert policy.poll_source_snapshot().reference.source_newest_frame_index == 111
+
+
+def test_changed_epoch_restarts_lower_progress_only_after_new_arm_proof(
+    policy_harness,
+):
+    policy = policy_harness.policy
+    authorize_reference(policy, make_reference(
+        epoch=71, newest_frame=110, row_marker=1.0,
+    ))
+    policy_harness.step()
+
+    policy.inject_status(make_status(
+        status_sequence=1, source_epoch=72, last_arm_command_id=8,
+        last_arm_target_epoch=72, last_requested_arm_epoch=72,
+        accepted_arm_epoch=72, newest_frame_index=10,
+    ))
+    policy.inject_reference(make_reference(
+        epoch=72, newest_frame=10, row_marker=2.0,
+    ))
+    snapshot = policy.poll_source_snapshot()
+    assert snapshot.status.status_sequence == 1
+    assert snapshot.reference.source_newest_frame_index == 10
+
+    policy_harness.step()
+    assert not policy.live_reference_gate_open
+    assert not policy.open_live_reference_gate(
+        source_epoch=72, minimum_source_frame_index=10,
+        reset_yaw=True, arm_proof=None,
+    )
+    assert policy.open_live_reference_gate(
+        source_epoch=72, minimum_source_frame_index=10,
+        reset_yaw=True, arm_proof=ArmGateProof(8, 72, 72, 0),
+    )
+    policy_harness.step()
+    assert policy.input_buffer[0, 0] == pytest.approx(2.0)
+
+    policy.inject_status(make_status(
+        status_sequence=2, source_epoch=72, last_arm_command_id=8,
+        last_arm_target_epoch=72, last_requested_arm_epoch=72,
+        accepted_arm_epoch=72, newest_frame_index=10,
+    ))
+    policy.inject_reference(make_reference(
+        epoch=72, newest_frame=9, row_marker=3.0,
+    ))
+    policy_harness.step()
+
+    assert policy.live_reference_gate_open
+    assert policy.input_buffer[0, 0] == pytest.approx(2.0)
+
+
 def test_false_ready_reference_is_observable_but_cannot_open_gate(policy):
     policy.inject_status(make_status(
         status_sequence=11, source_epoch=71, last_arm_command_id=7,

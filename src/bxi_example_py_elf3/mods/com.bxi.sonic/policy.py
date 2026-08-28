@@ -337,6 +337,21 @@ _DECODE_ERRORS = (
 )
 
 
+def _validate_source_topics(reference_topic: object, status_topic: object) -> None:
+    if (
+        not isinstance(reference_topic, str)
+        or not reference_topic
+        or not isinstance(status_topic, str)
+        or not status_topic
+    ):
+        raise ValueError("SONIC ZMQ topics must be nonempty strings")
+    if (
+        reference_topic.startswith(status_topic)
+        or status_topic.startswith(reference_topic)
+    ):
+        raise ValueError("SONIC ZMQ topics must not overlap by prefix")
+
+
 class SonicTeleopPolicy(JointPolicy):
     """SONIC SMPL teleoperation policy using the shared inference runtime."""
 
@@ -364,6 +379,10 @@ class SonicTeleopPolicy(JointPolicy):
         monotonic: MonotonicSeconds = time.monotonic,
         monotonic_ns: MonotonicNanoseconds = time.monotonic_ns,
     ) -> None:
+        _validate_source_topics(
+            smpl_ref_zmq_topic,
+            xsens_status_zmq_topic,
+        )
         super().__init__()
         self.model_onnx_path = str(model_onnx_path)
         self.stream_reference_npz = str(stream_reference_npz)
@@ -387,6 +406,9 @@ class SonicTeleopPolicy(JointPolicy):
         self._latest_status: XsensStatusSnapshot | None = None
         self._latest_reference: SmplReferenceFrame | None = None
         self._latest_authorized_reference: SmplReferenceFrame | None = None
+        self._source_progress_epoch: int | None = None
+        self._source_progress_status_sequence: int | None = None
+        self._source_progress_frame_index: int | None = None
         self.yaw_bias_rad = float(yaw_bias_rad)
         self.live_ref_timeout_s = float(live_ref_timeout_s)
         self.idle_frame_start = int(idle_frame_start)
@@ -658,6 +680,9 @@ class SonicTeleopPolicy(JointPolicy):
         self._gate_hold_requested = False
         self.pending_yaw_offset = None
         self._latest_authorized_reference = None
+        self._source_progress_epoch = None
+        self._source_progress_status_sequence = None
+        self._source_progress_frame_index = None
         self._drain_source_queues()
 
         target = (
@@ -823,6 +848,84 @@ class SonicTeleopPolicy(JointPolicy):
         self.live_sequence += 1
         return frame
 
+    def _status_advances_progress(self, status: XsensStatusSnapshot) -> bool:
+        cached = self._latest_status
+        if cached is not None and cached.source_epoch == status.source_epoch:
+            if status.status_sequence <= cached.status_sequence:
+                return False
+            if status.newest_frame_index < cached.newest_frame_index:
+                return False
+        if self._source_progress_epoch == status.source_epoch:
+            sequence = self._source_progress_status_sequence
+            frame_index = self._source_progress_frame_index
+            if sequence is not None and status.status_sequence <= sequence:
+                return False
+            if frame_index is not None and status.newest_frame_index < frame_index:
+                return False
+        authorized = self._latest_authorized_reference
+        if (
+            authorized is not None
+            and authorized.source_epoch == status.source_epoch
+            and authorized.source_newest_frame_index is not None
+            and status.newest_frame_index
+            < authorized.source_newest_frame_index
+        ):
+            return False
+        return True
+
+    def _reference_advances_progress(
+        self,
+        reference: SmplReferenceFrame,
+    ) -> bool:
+        epoch = reference.source_epoch
+        frame_index = reference.source_newest_frame_index
+        if epoch is None or frame_index is None:
+            return True
+        floors = []
+        cached = self._latest_reference
+        if (
+            cached is not None
+            and cached.source_epoch == epoch
+            and cached.source_newest_frame_index is not None
+        ):
+            floors.append(cached.source_newest_frame_index)
+        authorized = self._latest_authorized_reference
+        if (
+            authorized is not None
+            and authorized.source_epoch == epoch
+            and authorized.source_newest_frame_index is not None
+        ):
+            floors.append(authorized.source_newest_frame_index)
+        if (
+            self._source_progress_epoch == epoch
+            and self._source_progress_frame_index is not None
+        ):
+            floors.append(self._source_progress_frame_index)
+        return not floors or frame_index > max(floors)
+
+    def _advance_source_progress(
+        self,
+        status: XsensStatusSnapshot,
+        reference: SmplReferenceFrame,
+    ) -> None:
+        assert reference.source_epoch == status.source_epoch
+        assert reference.source_newest_frame_index is not None
+        if self._source_progress_epoch != status.source_epoch:
+            self._source_progress_epoch = status.source_epoch
+            self._source_progress_status_sequence = status.status_sequence
+            self._source_progress_frame_index = (
+                reference.source_newest_frame_index
+            )
+            return
+        self._source_progress_status_sequence = max(
+            status.status_sequence,
+            self._source_progress_status_sequence or 0,
+        )
+        self._source_progress_frame_index = max(
+            reference.source_newest_frame_index,
+            self._source_progress_frame_index or -1,
+        )
+
     def poll_source_snapshot(self) -> JoinedSourceSnapshot:
         if not self.use_smpl_ref_zmq:
             return JoinedSourceSnapshot(
@@ -840,9 +943,11 @@ class SonicTeleopPolicy(JointPolicy):
                         message, self.xsens_status_zmq_topic
                     )
                     if fields:
-                        self._latest_status = self._status_from_fields(
+                        status = self._status_from_fields(
                             fields, received
                         )
+                        if self._status_advances_progress(status):
+                            self._latest_status = status
                 except _DECODE_ERRORS:
                     continue
 
@@ -852,9 +957,11 @@ class SonicTeleopPolicy(JointPolicy):
                         message, self.smpl_ref_zmq_topic
                     )
                     if fields:
-                        self._latest_reference = self._frame_from_fields(
+                        reference = self._frame_from_fields(
                             fields, received
                         )
+                        if self._reference_advances_progress(reference):
+                            self._latest_reference = reference
                 except _DECODE_ERRORS:
                     continue
 
@@ -920,6 +1027,9 @@ class SonicTeleopPolicy(JointPolicy):
         maximum_producer_age = int(
             self.live_ref_timeout_s * 1_000_000_000
         )
+        progress_matches = self._source_progress_epoch == source_epoch
+        progress_sequence = self._source_progress_status_sequence
+        progress_frame = self._source_progress_frame_index
         return bool(
             source_epoch > 0
             and 0.0 <= status_local_age <= self.status_timeout_s
@@ -938,6 +1048,21 @@ class SonicTeleopPolicy(JointPolicy):
             >= minimum_source_frame_index
             and status.newest_frame_index
             >= reference.source_newest_frame_index
+            and (
+                not progress_matches
+                or progress_sequence is None
+                or status.status_sequence >= progress_sequence
+            )
+            and (
+                not progress_matches
+                or progress_frame is None
+                or status.newest_frame_index >= progress_frame
+            )
+            and (
+                not progress_matches
+                or progress_frame is None
+                or reference.source_newest_frame_index >= progress_frame
+            )
         )
 
     def open_live_reference_gate(
@@ -988,6 +1113,7 @@ class SonicTeleopPolicy(JointPolicy):
         self._gate_rearm_required = False
         self._gate_reset_yaw_requested = bool(reset_yaw)
         self._latest_authorized_reference = reference
+        self._advance_source_progress(status, reference)
         return True
 
     def close_live_reference_gate(
@@ -1035,8 +1161,13 @@ class SonicTeleopPolicy(JointPolicy):
             )
         )
         if valid:
+            assert snapshot.status is not None
             assert snapshot.reference is not None
             self._latest_authorized_reference = snapshot.reference
+            self._advance_source_progress(
+                snapshot.status,
+                snapshot.reference,
+            )
             return snapshot.reference, "live", now_mono
         if self.live_reference_gate_open:
             changed_epoch = bool(
