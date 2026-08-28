@@ -130,6 +130,17 @@ def test_authoritative_xsens_rejects_wrong_or_nonprogressing_rows(indices):
         _build_authoritative_xsens_smpl_ref(make_xsens_pose_fields(indices=indices))
 
 
+def test_authoritative_pose_rejects_int64_extreme_backward_step():
+    int64_min = -9_223_372_036_854_775_808
+    indices = np.array(
+        [1, *range(int64_min, int64_min + 9)], dtype=np.int64
+    )
+    with pytest.raises(ValueError, match="frame_index"):
+        _build_authoritative_xsens_smpl_ref(
+            make_xsens_pose_fields(indices=indices)
+        )
+
+
 def test_status_send_failure_blocks_reference_until_barrier_succeeds(bridge_harness):
     bridge_harness.output.fail_next_topic = "xsens_status"
     bridge_harness.input_status(make_status(status_sequence=2, source_epoch=71))

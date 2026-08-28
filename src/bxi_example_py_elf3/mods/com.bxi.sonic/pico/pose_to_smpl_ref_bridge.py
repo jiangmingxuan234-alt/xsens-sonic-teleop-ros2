@@ -390,7 +390,7 @@ def _build_authoritative_xsens_smpl_ref(
         raise ValueError("producer_monotonic_ns must be positive")
     if int(fields["source_epoch"][0]) <= 0:
         raise ValueError("source_epoch must be positive")
-    if np.any(np.diff(fields["frame_index"]) <= 0):
+    if np.any(fields["frame_index"][1:] <= fields["frame_index"][:-1]):
         raise ValueError("frame_index must be strictly increasing")
 
     return {
