@@ -815,10 +815,10 @@ void load_bindings(const YAML::Node &node, RemoteConfig &config, const std::stri
         }
         binding.output = item["output"].as<std::string>();
         binding.mode = mode;
-        binding.requires_driver_filter = get_or<std::string>(
-            item,
-            "requires_driver_filter",
-            "");
+    binding.requires_driver_filter = get_or<std::string>(
+      item,
+      "requires_driver_filter",
+      "");
         binding.when = load_condition(
             item["when"], config, "outputs." + mode + "[].when");
         if (binding.output.empty()) {
@@ -989,9 +989,9 @@ void validate_config(RemoteConfig &config)
     std::set<std::string> semantic_sources;
     std::set<std::string> raw_sources;
     std::set<std::string> intentionally_exposed_sources;
-    std::set<std::string> input_driver_filters;
+  std::set<std::string> input_driver_filters;
     for (const auto &device : config.input_devices) {
-        input_driver_filters.insert(device.type);
+    input_driver_filters.insert(device.type);
         if (device.type != "crsf") {
             continue;
         }
@@ -1190,12 +1190,13 @@ void validate_config(RemoteConfig &config)
     std::map<int, std::set<int>> level_values_by_slot;
     std::map<int, std::set<int>> edge_values_by_slot;
     for (const auto &binding : config.bindings) {
-        if (!binding.requires_driver_filter.empty() &&
-            input_driver_filters.count(binding.requires_driver_filter) == 0) {
-            throw std::runtime_error(
-                "binding " + binding.output +
-                " requires unknown driver filter: " + binding.requires_driver_filter);
-        }
+    if (!binding.requires_driver_filter.empty() &&
+      input_driver_filters.count(binding.requires_driver_filter) == 0)
+    {
+      throw std::runtime_error(
+              "binding " + binding.output +
+              " requires unknown driver filter: " + binding.requires_driver_filter);
+    }
         if (binding.mode != "level" && binding.mode != "edge") {
             throw std::runtime_error("binding mode must be level or edge");
         }
@@ -1328,8 +1329,8 @@ char key_from_name(const std::string &name)
 }
 
 RemoteConfig load_remote_config(
-    const std::string &path,
-    const std::string &driver_filter)
+  const std::string & path,
+  const std::string & driver_filter)
 {
     RemoteConfig config;
     const YAML::Node root = YAML::LoadFile(path);
@@ -1345,15 +1346,15 @@ RemoteConfig load_remote_config(
     for (const auto &action : load_string_list(root["system_reset_motion_after"])) {
         config.reset_motion_after_system.insert(action);
     }
-    validate_config(config);
-    config.bindings.erase(
-        std::remove_if(
-            config.bindings.begin(), config.bindings.end(),
-            [&driver_filter](const Binding &binding) {
-                return !binding.requires_driver_filter.empty() &&
-                    binding.requires_driver_filter != driver_filter;
-            }),
-        config.bindings.end());
+  validate_config(config);
+  config.bindings.erase(
+    std::remove_if(
+      config.bindings.begin(), config.bindings.end(),
+      [&driver_filter](const Binding & binding) {
+        return !binding.requires_driver_filter.empty() &&
+        binding.requires_driver_filter != driver_filter;
+      }),
+    config.bindings.end());
 
     return config;
 }

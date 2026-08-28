@@ -22,7 +22,7 @@ public:
         const std::string &driver_filter,
         bool driver_debug_enabled)
         : Node("COM_publisher"),
-          mapper_(remote_controller::load_remote_config(config_path, driver_filter))
+    mapper_(remote_controller::load_remote_config(config_path, driver_filter))
     {
         print_config_diagnostics(mapper_.config());
         com_pub_ = this->create_publisher<communication::msg::MotionCommands>(

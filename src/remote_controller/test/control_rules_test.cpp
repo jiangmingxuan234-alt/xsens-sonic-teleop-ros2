@@ -1,3 +1,5 @@
+#include <yaml-cpp/yaml.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -10,8 +12,6 @@
 #include <vector>
 
 #include "remote_controller/input_mapper.hpp"
-
-#include <yaml-cpp/yaml.h>
 
 namespace {
 
@@ -269,204 +269,211 @@ void test_three_button_chord_excludes_two_button_x_chords()
 
 void test_xsens_gamepad_chord_emits_btn_10_11()
 {
-    InputMapper mapper(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
-    mapper.set_signals({
-        {"js.axis.5", 1.0},
-        {"js.axis.4", 1.0},
-        {"js.button.4", 1.0},
-        {"js.button.6", 0.0},
-        {"js.button.7", 0.0},
+  InputMapper mapper(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+  mapper.set_signals(
+    {
+      {"js.axis.5", 1.0},
+      {"js.axis.4", 1.0},
+      {"js.button.4", 1.0},
+      {"js.button.6", 0.0},
+      {"js.button.7", 0.0},
     });
-    communication::msg::MotionCommands message;
-    mapper.fill_message(message);
-    expect(message.btn_10 == 11);
+  communication::msg::MotionCommands message;
+  mapper.fill_message(message);
+  expect(message.btn_10 == 11);
 }
 
 void test_xsens_gamepad_chord_transitions_11_zero_11()
 {
-    InputMapper mapper(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
-    communication::msg::MotionCommands message;
+  InputMapper mapper(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+  communication::msg::MotionCommands message;
 
-    mapper.set_signals({
-        {"js.axis.5", 1.0},
-        {"js.axis.4", 1.0},
-        {"js.button.4", 1.0},
-        {"js.button.6", 0.0},
-        {"js.button.7", 0.0},
+  mapper.set_signals(
+    {
+      {"js.axis.5", 1.0},
+      {"js.axis.4", 1.0},
+      {"js.button.4", 1.0},
+      {"js.button.6", 0.0},
+      {"js.button.7", 0.0},
     });
-    mapper.fill_message(message);
-    expect(message.btn_10 == 11);
+  mapper.fill_message(message);
+  expect(message.btn_10 == 11);
 
-    mapper.set_signals({
-        {"js.axis.5", 0.0},
-        {"js.axis.4", 0.0},
-        {"js.button.4", 0.0},
-        {"js.button.6", 0.0},
-        {"js.button.7", 0.0},
+  mapper.set_signals(
+    {
+      {"js.axis.5", 0.0},
+      {"js.axis.4", 0.0},
+      {"js.button.4", 0.0},
+      {"js.button.6", 0.0},
+      {"js.button.7", 0.0},
     });
-    mapper.fill_message(message);
-    expect(message.btn_10 == 0);
+  mapper.fill_message(message);
+  expect(message.btn_10 == 0);
 
-    mapper.set_signals({
-        {"js.axis.5", 1.0},
-        {"js.axis.4", 1.0},
-        {"js.button.4", 1.0},
-        {"js.button.6", 0.0},
-        {"js.button.7", 0.0},
+  mapper.set_signals(
+    {
+      {"js.axis.5", 1.0},
+      {"js.axis.4", 1.0},
+      {"js.button.4", 1.0},
+      {"js.button.6", 0.0},
+      {"js.button.7", 0.0},
     });
-    mapper.fill_message(message);
-    expect(message.btn_10 == 11);
+  mapper.fill_message(message);
+  expect(message.btn_10 == 11);
 }
 
 void test_xsens_crsf_chord_emits_btn_10_11()
 {
-    InputMapper mapper(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
-    mapper.set_signals({
-        {"crsf.channel.7", 1.0},
-        {"crsf.channel.3", 1.0},
-        {"crsf.channel.8", -0.2},
-        {"crsf.channel.9", 0.0},
+  InputMapper mapper(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+  mapper.set_signals(
+    {
+      {"crsf.channel.7", 1.0},
+      {"crsf.channel.3", 1.0},
+      {"crsf.channel.8", -0.2},
+      {"crsf.channel.9", 0.0},
     });
-    communication::msg::MotionCommands message;
-    mapper.fill_message(message);
-    expect(message.btn_10 == 11);
+  communication::msg::MotionCommands message;
+  mapper.fill_message(message);
+  expect(message.btn_10 == 11);
 }
 
 int xsens_gamepad_value(double lt, double rt, double y, double lb, double rb)
 {
-    InputMapper mapper(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
-    mapper.set_signals({
-        {"js.axis.5", lt}, {"js.axis.4", rt}, {"js.button.4", y},
-        {"js.button.6", lb}, {"js.button.7", rb},
+  InputMapper mapper(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+  mapper.set_signals(
+    {
+      {"js.axis.5", lt}, {"js.axis.4", rt}, {"js.button.4", y},
+      {"js.button.6", lb}, {"js.button.7", rb},
     });
-    communication::msg::MotionCommands message;
-    mapper.fill_message(message);
-    return message.btn_10;
+  communication::msg::MotionCommands message;
+  mapper.fill_message(message);
+  return message.btn_10;
 }
 
 int xsens_crsf_value(
-    double lt, double rt, double button_group_a, double button_group_b)
+  double lt, double rt, double button_group_a, double button_group_b)
 {
-    InputMapper mapper(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
-    mapper.set_signals({
-        {"crsf.channel.7", lt}, {"crsf.channel.3", rt},
-        {"crsf.channel.8", button_group_a},
-        {"crsf.channel.9", button_group_b},
+  InputMapper mapper(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+  mapper.set_signals(
+    {
+      {"crsf.channel.7", lt}, {"crsf.channel.3", rt},
+      {"crsf.channel.8", button_group_a},
+      {"crsf.channel.9", button_group_b},
     });
-    communication::msg::MotionCommands message;
-    mapper.fill_message(message);
-    return message.btn_10;
+  communication::msg::MotionCommands message;
+  mapper.fill_message(message);
+  return message.btn_10;
 }
 
 void test_xsens_chord_guards_and_release()
 {
-    expect(xsens_gamepad_value(0.0, 1.0, 1.0, 0.0, 0.0) != 11);
-    expect(xsens_gamepad_value(1.0, 0.0, 1.0, 0.0, 0.0) != 11);
-    expect(xsens_gamepad_value(1.0, 1.0, 0.0, 0.0, 0.0) != 11);
-    expect(xsens_gamepad_value(1.0, 1.0, 1.0, 1.0, 0.0) != 11);
-    expect(xsens_gamepad_value(1.0, 1.0, 1.0, 0.0, 1.0) != 11);
-    expect(xsens_gamepad_value(0.0, 0.0, 0.0, 0.0, 0.0) == 0);
+  expect(xsens_gamepad_value(0.0, 1.0, 1.0, 0.0, 0.0) != 11);
+  expect(xsens_gamepad_value(1.0, 0.0, 1.0, 0.0, 0.0) != 11);
+  expect(xsens_gamepad_value(1.0, 1.0, 0.0, 0.0, 0.0) != 11);
+  expect(xsens_gamepad_value(1.0, 1.0, 1.0, 1.0, 0.0) != 11);
+  expect(xsens_gamepad_value(1.0, 1.0, 1.0, 0.0, 1.0) != 11);
+  expect(xsens_gamepad_value(0.0, 0.0, 0.0, 0.0, 0.0) == 0);
 }
 
 void test_xsens_crsf_guards_and_release()
 {
-    constexpr double y = -0.2;
-    constexpr double idle = 0.0;
-    expect(xsens_crsf_value(1.0, 1.0, y, idle) == 11);
-    expect(xsens_crsf_value(0.0, 1.0, y, idle) != 11);
-    expect(xsens_crsf_value(1.0, 0.0, y, idle) != 11);
-    expect(xsens_crsf_value(1.0, 1.0, idle, idle) != 11);
-    expect(xsens_crsf_value(1.0, 1.0, y, -0.9) != 11); // LB
-    expect(xsens_crsf_value(1.0, 1.0, y, -0.7) != 11); // RB
-    expect(xsens_crsf_value(0.0, 0.0, idle, idle) == 0);
+  constexpr double y = -0.2;
+  constexpr double idle = 0.0;
+  expect(xsens_crsf_value(1.0, 1.0, y, idle) == 11);
+  expect(xsens_crsf_value(0.0, 1.0, y, idle) != 11);
+  expect(xsens_crsf_value(1.0, 0.0, y, idle) != 11);
+  expect(xsens_crsf_value(1.0, 1.0, idle, idle) != 11);
+  expect(xsens_crsf_value(1.0, 1.0, y, -0.9) != 11);    // LB
+  expect(xsens_crsf_value(1.0, 1.0, y, -0.7) != 11);    // RB
+  expect(xsens_crsf_value(0.0, 0.0, idle, idle) == 0);
 }
 
 void test_xsens_keyboard_requires_explicit_filter_and_expires()
 {
-    communication::msg::MotionCommands message;
-    InputMapper hardware(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH));
-    hardware.handle_keyboard_key('r');
-    hardware.fill_message(message);
-    expect(message.btn_10 == 0);
+  communication::msg::MotionCommands message;
+  InputMapper hardware(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH));
+  hardware.handle_keyboard_key('r');
+  hardware.fill_message(message);
+  expect(message.btn_10 == 0);
 
-    InputMapper keyboard(remote_controller::load_remote_config(
-        REMOTE_CONTROLLER_TEST_CONFIG_PATH, "keyboard"));
-    keyboard.handle_keyboard_key('r');
-    keyboard.fill_message(message);
-    expect(message.btn_10 == 11);
-    std::this_thread::sleep_for(std::chrono::milliseconds(210));
-    keyboard.tick();
-    keyboard.fill_message(message);
-    expect(message.btn_10 == 0);
+  InputMapper keyboard(remote_controller::load_remote_config(
+      REMOTE_CONTROLLER_TEST_CONFIG_PATH, "keyboard"));
+  keyboard.handle_keyboard_key('r');
+  keyboard.fill_message(message);
+  expect(message.btn_10 == 11);
+  std::this_thread::sleep_for(std::chrono::milliseconds(210));
+  keyboard.tick();
+  keyboard.fill_message(message);
+  expect(message.btn_10 == 0);
 }
 
-std::string write_filter_fixture(const std::string &required_filter)
+std::string write_filter_fixture(const std::string & required_filter)
 {
-    YAML::Node root = YAML::LoadFile(REMOTE_CONTROLLER_TEST_CONFIG_PATH);
-    YAML::Node binding;
-    binding["output"] = "btn_10=11";
-    binding["requires_driver_filter"] = required_filter;
-    binding["when"].push_back("keyboard.sonic_event");
-    root["outputs"]["level"].push_back(binding);
-    const std::string path = "/tmp/remote_controller_driver_filter_test.yaml";
-    std::ofstream stream(path);
-    stream << root;
-    stream.close();
-    return path;
+  YAML::Node root = YAML::LoadFile(REMOTE_CONTROLLER_TEST_CONFIG_PATH);
+  YAML::Node binding;
+  binding["output"] = "btn_10=11";
+  binding["requires_driver_filter"] = required_filter;
+  binding["when"].push_back("keyboard.sonic_event");
+  root["outputs"]["level"].push_back(binding);
+  const std::string path = "/tmp/remote_controller_driver_filter_test.yaml";
+  std::ofstream stream(path);
+  stream << root;
+  stream.close();
+  return path;
 }
 
 void test_binding_driver_filter_selection()
 {
-    const std::string path = write_filter_fixture("keyboard");
-    const RemoteConfig hardware = remote_controller::load_remote_config(
-        path);
-    const RemoteConfig keyboard = remote_controller::load_remote_config(
-        path, "keyboard");
-    const RemoteConfig joystick = remote_controller::load_remote_config(
-        path, "joystick");
+  const std::string path = write_filter_fixture("keyboard");
+  const RemoteConfig hardware = remote_controller::load_remote_config(
+    path);
+  const RemoteConfig keyboard = remote_controller::load_remote_config(
+    path, "keyboard");
+  const RemoteConfig joystick = remote_controller::load_remote_config(
+    path, "joystick");
 
-    const auto has_keyboard_xsens = [](const RemoteConfig &config) {
-        return std::any_of(
-            config.bindings.begin(), config.bindings.end(),
-            [](const remote_controller::Binding &binding) {
-                return binding.output == "btn_10=11" &&
-                    binding.requires_driver_filter == "keyboard";
-            });
+  const auto has_keyboard_xsens = [](const RemoteConfig & config) {
+      return std::any_of(
+        config.bindings.begin(), config.bindings.end(),
+        [](const remote_controller::Binding & binding) {
+          return binding.output == "btn_10=11" &&
+          binding.requires_driver_filter == "keyboard";
+        });
     };
-    expect(!has_keyboard_xsens(hardware));
-    expect(has_keyboard_xsens(keyboard));
-    expect(!has_keyboard_xsens(joystick));
+  expect(!has_keyboard_xsens(hardware));
+  expect(has_keyboard_xsens(keyboard));
+  expect(!has_keyboard_xsens(joystick));
 
-    const auto ungated_outputs = [](const RemoteConfig &config) {
-        std::vector<std::string> outputs;
-        for (const auto &binding : config.bindings) {
-            if (binding.requires_driver_filter.empty()) {
-                outputs.push_back(binding.output);
-            }
+  const auto ungated_outputs = [](const RemoteConfig & config) {
+      std::vector<std::string> outputs;
+      for (const auto & binding : config.bindings) {
+        if (binding.requires_driver_filter.empty()) {
+          outputs.push_back(binding.output);
         }
-        return outputs;
+      }
+      return outputs;
     };
-    expect(ungated_outputs(hardware) == ungated_outputs(keyboard));
-    std::remove(path.c_str());
+  expect(ungated_outputs(hardware) == ungated_outputs(keyboard));
+  std::remove(path.c_str());
 }
 
 void test_unknown_binding_driver_filter_is_rejected()
 {
-    const std::string path = write_filter_fixture("unknown_driver");
-    bool threw = false;
-    try {
-        remote_controller::load_remote_config(path, "keyboard");
-    } catch (const std::runtime_error &) {
-        threw = true;
-    }
-    std::remove(path.c_str());
-    expect(threw);
+  const std::string path = write_filter_fixture("unknown_driver");
+  bool threw = false;
+  try {
+    remote_controller::load_remote_config(path, "keyboard");
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  std::remove(path.c_str());
+  expect(threw);
 }
 
 }  // namespace
@@ -478,13 +485,13 @@ int main()
     test_bool_all_keeps_inactive_raw_inputs_in_the_selected_group();
     test_debug_reports_changed_rule_selection();
     test_three_button_chord_excludes_two_button_x_chords();
-    test_xsens_gamepad_chord_emits_btn_10_11();
-    test_xsens_gamepad_chord_transitions_11_zero_11();
-    test_xsens_crsf_chord_emits_btn_10_11();
-    test_xsens_chord_guards_and_release();
-    test_xsens_crsf_guards_and_release();
-    test_xsens_keyboard_requires_explicit_filter_and_expires();
-    test_binding_driver_filter_selection();
-    test_unknown_binding_driver_filter_is_rejected();
+  test_xsens_gamepad_chord_emits_btn_10_11();
+  test_xsens_gamepad_chord_transitions_11_zero_11();
+  test_xsens_crsf_chord_emits_btn_10_11();
+  test_xsens_chord_guards_and_release();
+  test_xsens_crsf_guards_and_release();
+  test_xsens_keyboard_requires_explicit_filter_and_expires();
+  test_binding_driver_filter_selection();
+  test_unknown_binding_driver_filter_is_rejected();
     return 0;
 }
