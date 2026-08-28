@@ -57,16 +57,30 @@ def state_types():
 class FakeCommandPublisher:
     def __init__(self):
         self.messages = []
+        self.attempts = []
+        self.failures = []
 
     def publish(self, message):
         clone = Int64MultiArray()
         clone.layout.dim = []
         clone.layout.data_offset = int(message.layout.data_offset)
         clone.data = list(message.data)
-        self.messages.append(SimpleNamespace(
+        captured = SimpleNamespace(
             layout=clone.layout,
             data=list(clone.data),
-        ))
+        )
+        self.attempts.append(captured)
+        if self.failures:
+            raise self.failures.pop(0)
+        self.messages.append(captured)
+
+
+class IntegerProtocolValue:
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        return self.value
 
 
 class FakeRosNode:
@@ -131,7 +145,7 @@ class StateHarness:
     def __init__(
         self, state_types, *, clock=None,
         command_ids=(101, 102, 103, 104, 105, 106),
-        measured_offset=0.25,
+        command_id_factory=None, publisher_failures=(), measured_offset=0.25,
     ):
         self.types = state_types
         self.policy_harness = PolicyHarness()
@@ -141,12 +155,16 @@ class StateHarness:
         self.policy._monotonic_ns = self.clock.monotonic_ns
         self.policy.test_clock = self.clock
         self.ctx = FakeStateContext(measured_offset)
+        self.ctx.ros_node.publisher.failures.extend(publisher_failures)
         self.logger = CaptureLogger()
         self._command_ids = iter(command_ids)
+        factory = command_id_factory or (
+            lambda: next(self._command_ids)
+        )
         self.state = state_types.XsensSonicTeleopState(
             "sonic_xsens", 77, ReadyPolicyHandle(self.policy),
             operator_prompt="保持近似中立姿势，等待 Xsens READY",
-            command_id_factory=lambda: next(self._command_ids),
+            command_id_factory=factory,
             monotonic=self.clock.monotonic,
         )
         self.state._bind_logger(self.logger)
@@ -157,6 +175,10 @@ class StateHarness:
     @property
     def published_commands(self):
         return self.ctx.ros_node.publisher.messages
+
+    @property
+    def publish_attempts(self):
+        return self.ctx.ros_node.publisher.attempts
 
     @property
     def arm_commands_after_live(self):
@@ -360,6 +382,85 @@ def test_neutral_latch_requires_exact_zero(state_harness):
     assert state_harness.state.neutral_latch_open
 
 
+@pytest.mark.parametrize(
+    "value",
+    [False, True, 0.0, -0.0, 1, -1, np.int64(1), IntegerProtocolValue(1)],
+)
+def test_entry_runtime_slot_rejects_non_exact_integer_zero(
+    state_types, value,
+):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(value)
+        assert not harness.state.neutral_latch_open
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, np.int64(0), IntegerProtocolValue(0)],
+)
+def test_entry_runtime_slot_accepts_integer_protocol_zero(state_types, value):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(value)
+        assert harness.state.neutral_latch_open
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [False, True, 0.0, -0.0, 1, -1, np.int64(1), IntegerProtocolValue(1)],
+)
+def test_observed_runtime_slot_rejects_non_exact_integer_zero(
+    state_types, value,
+):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(11)
+        harness.observe_slot(value)
+        assert not harness.state.neutral_latch_open
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, np.int64(0), IntegerProtocolValue(0)],
+)
+def test_observed_runtime_slot_accepts_integer_protocol_zero(
+    state_types, value,
+):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(11)
+        harness.observe_slot(value)
+        assert harness.state.neutral_latch_open
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("value", [False, 0.0, -0.0])
+def test_false_or_float_zero_slot_cannot_issue_ready_arm(state_types, value):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_with_slot(11)
+        harness.make_ready(epoch=71, status_sequence=20, newest_frame=109)
+        harness.observe_slot(value)
+        before = harness.command_count()
+        harness.set_slot(11)
+        assert harness.state.on_action(harness.ctx, "activate_xsens")
+        assert [message.data for message in harness.published_commands] == [
+            [101, 71, 0],
+        ]
+        assert harness.command_count() == before
+        assert not harness.state.arm_pending
+    finally:
+        harness.close()
+
+
 def test_arm_press_waits_for_exact_ack_and_reference_join(state_harness):
     state_harness.make_ready(epoch=71, status_sequence=20, newest_frame=109)
     state_harness.release_and_press()
@@ -487,6 +588,104 @@ def test_entry_disarm_requires_exact_newer_receipt(state_harness):
     assert not state_harness.state.disarm_pending
 
 
+def test_failed_entry_disarm_is_unsent_barrier_and_retries_new_id(
+    state_types,
+):
+    harness = StateHarness(
+        state_types,
+        publisher_failures=(RuntimeError("entry publish failed"),),
+    )
+    try:
+        harness.enter_with_slot(0)
+        harness.publish_status(
+            sequence=4, epoch=71, accepted=0, ready=True,
+            reference_window_ready=True, ready_frames=30,
+        )
+        harness.publish_reference(epoch=71, newest_frame=109)
+        harness.tick()
+
+        assert [attempt.data for attempt in harness.publish_attempts] == [
+            [101, 71, 0],
+        ]
+        assert harness.published_commands == []
+        assert harness.state.disarm_pending
+        assert harness.state.phase is state_types.XsensPhase.WAITING_FOR_DATA
+
+        harness.set_slot(11)
+        assert harness.state.on_action(harness.ctx, "activate_xsens")
+        assert harness.published_commands == []
+
+        harness.tick()
+        assert [attempt.data for attempt in harness.publish_attempts] == [
+            [101, 71, 0],
+            [102, 71, 0],
+        ]
+        assert harness.last_command().data == [102, 71, 0]
+        assert harness.state.disarm_pending
+        assert not harness.state.arm_pending
+    finally:
+        harness.close()
+
+
+def test_failed_arm_publish_does_not_commit_pending_and_consumes_id(
+    state_types,
+):
+    harness = StateHarness(state_types)
+    try:
+        harness.make_ready(epoch=71, status_sequence=20, newest_frame=109)
+        harness.ctx.ros_node.publisher.failures.append(
+            RuntimeError("arm publish failed")
+        )
+        harness.release_and_press()
+
+        assert [attempt.data[0] for attempt in harness.publish_attempts] == [
+            101,
+            102,
+        ]
+        assert [message.data[0] for message in harness.published_commands] == [
+            101,
+        ]
+        assert not harness.state.arm_pending
+        assert not harness.state.neutral_latch_open
+
+        harness.observe_slot(0)
+        harness.set_slot(11)
+        assert harness.state.on_action(harness.ctx, "activate_xsens")
+        assert harness.last_command().data == [103, 71, 71]
+        assert harness.state.arm_pending
+    finally:
+        harness.close()
+
+
+def test_failed_cancel_publish_becomes_retrying_disarm_barrier(state_types):
+    harness = StateHarness(state_types)
+    try:
+        harness.make_ready(epoch=71, status_sequence=20, newest_frame=109)
+        harness.release_and_press()
+        harness.ctx.ros_node.publisher.failures.append(
+            RuntimeError("cancel publish failed")
+        )
+        harness.publish_status(
+            sequence=21, epoch=71, accepted=0, ready=False,
+            reference_window_ready=False, ready_frames=0,
+        )
+        harness.tick()
+
+        assert [attempt.data[0] for attempt in harness.publish_attempts] == [
+            101,
+            102,
+            103,
+        ]
+        assert harness.state.disarm_pending
+        assert not harness.state.arm_pending
+
+        harness.tick()
+        assert harness.last_command().data == [104, 71, 0]
+        assert harness.state.disarm_pending
+    finally:
+        harness.close()
+
+
 def test_same_epoch_stale_auto_recovers_only_after_join(state_harness):
     state_harness.enter_live(epoch=71, newest_frame=110)
     state_harness.publish_status(
@@ -594,6 +793,111 @@ def test_new_epoch_substitutes_atomic_disarm_barrier(state_harness):
     )
 
 
+@pytest.mark.parametrize(
+    "mode,target_epoch,accepted_epoch",
+    [
+        ("waiting_disarm", 72, 71),
+        ("arm_pending", 72, 71),
+        ("live", 72, 71),
+        ("rearm_hold", 73, 72),
+    ],
+)
+def test_nonzero_new_epoch_requires_fresh_targeted_disarm_receipt(
+    state_types, mode, target_epoch, accepted_epoch,
+):
+    harness = StateHarness(state_types)
+    try:
+        if mode == "waiting_disarm":
+            harness.enter_with_slot(0)
+            harness.publish_status(
+                sequence=4, epoch=71, accepted=0, ready=False,
+                reference_window_ready=False, ready_frames=0,
+            )
+            harness.tick()
+        elif mode == "arm_pending":
+            harness.make_ready(
+                epoch=71, status_sequence=20, newest_frame=109
+            )
+            harness.release_and_press()
+        else:
+            harness.enter_live(epoch=71, newest_frame=110)
+            if mode == "rearm_hold":
+                harness.change_epoch(epoch=72, sequence=1)
+
+        before = harness.command_count()
+        previous_ids = {
+            message.data[0] for message in harness.published_commands
+        }
+        harness.publish_status(
+            sequence=1, epoch=target_epoch, accepted=accepted_epoch,
+            ready=False, reference_window_ready=False, ready_frames=2,
+            newest_frame=2, reason_code=XsensReason.SESSION_RESET,
+        )
+        harness.tick()
+
+        assert harness.state.current_source_epoch == target_epoch
+        assert harness.command_count() == before + 1
+        disarm = harness.last_command()
+        assert disarm.data[1:] == [target_epoch, 0]
+        assert disarm.data[0] not in previous_ids
+        assert harness.state.disarm_pending
+        if mode in {"live", "rearm_hold"}:
+            assert (
+                harness.state.link_status
+                is state_types.XsensLinkStatus.HOLD_REARM_REQUIRED
+            )
+            assert not harness.policy.live_reference_gate_open
+        else:
+            assert harness.state.phase is state_types.XsensPhase.WAITING_FOR_DATA
+            assert not harness.state.arm_pending
+
+        harness.publish_status(
+            sequence=2, epoch=target_epoch,
+            command_id=disarm.data[0], target=target_epoch,
+            requested=0, accepted=0, ready=False,
+            reference_window_ready=False, ready_frames=3,
+            newest_frame=3, reason_code=XsensReason.SESSION_RESET,
+        )
+        harness.tick()
+        assert not harness.state.disarm_pending
+    finally:
+        harness.close()
+
+
+def test_failed_nonzero_epoch_disarm_preserves_and_retries_barrier(
+    state_types,
+):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_live(epoch=71, newest_frame=110)
+        before = harness.command_count()
+        harness.ctx.ros_node.publisher.failures.append(
+            RuntimeError("epoch disarm publish failed")
+        )
+        harness.publish_status(
+            sequence=1, epoch=72, accepted=71, ready=False,
+            reference_window_ready=False, ready_frames=2,
+            newest_frame=2, reason_code=XsensReason.SESSION_RESET,
+        )
+        harness.tick()
+
+        assert harness.command_count() == before
+        assert harness.publish_attempts[-1].data == [103, 72, 0]
+        assert harness.state.current_source_epoch == 72
+        assert harness.state.disarm_pending
+        assert (
+            harness.state.link_status
+            is state_types.XsensLinkStatus.HOLD_REARM_REQUIRED
+        )
+        assert not harness.policy.live_reference_gate_open
+
+        harness.tick()
+        assert harness.last_command().data == [104, 72, 0]
+        assert harness.state.disarm_pending
+    finally:
+        harness.close()
+
+
 def test_waiting_and_ready_select_idle_frame_3509(state_harness):
     state_harness.enter_with_slot(0)
     state_harness.tick()
@@ -626,6 +930,56 @@ def test_command_id_draw_rejects_negative_zero_large_and_collision(state_types):
         ]
         assert harness.last_command().data == [102, 71, 71]
     finally:
+        harness.close()
+
+
+def test_command_id_draw_stops_after_32_invalid_candidates(state_types):
+    calls = []
+
+    def invalid_factory():
+        calls.append(None)
+        if len(calls) <= 32:
+            return False
+        raise AssertionError("factory inspected more than 32 candidates")
+
+    harness = StateHarness(state_types, command_id_factory=invalid_factory)
+    try:
+        harness.enter_with_slot(0)
+        harness.publish_status(sequence=4, epoch=71, accepted=0)
+        with pytest.raises(RuntimeError, match="32"):
+            harness.tick()
+        assert len(calls) == 32
+        assert harness.publish_attempts == []
+    finally:
+        harness.state._command_id_factory = lambda: 901
+        harness.close()
+
+
+def test_command_id_draw_stops_after_32_duplicate_candidates(state_types):
+    calls = []
+
+    def duplicate_factory():
+        calls.append(None)
+        if len(calls) == 1:
+            return 101
+        if len(calls) <= 33:
+            return 101
+        raise AssertionError("factory inspected more than 32 candidates")
+
+    harness = StateHarness(state_types, command_id_factory=duplicate_factory)
+    try:
+        harness.make_ready(epoch=71, status_sequence=20, newest_frame=109)
+        calls_after_entry = len(calls)
+        harness.observe_slot(0)
+        harness.set_slot(11)
+        with pytest.raises(RuntimeError, match="32"):
+            harness.state.on_action(harness.ctx, "activate_xsens")
+        assert len(calls) - calls_after_entry == 32
+        assert [message.data[0] for message in harness.published_commands] == [
+            101,
+        ]
+    finally:
+        harness.state._command_id_factory = lambda: 901
         harness.close()
 
 
@@ -995,6 +1349,55 @@ def test_state_exit_targets_latest_epoch_during_rearm_hold(state_harness):
     assert state_harness.last_command().data[1:] == [72, 0]
 
 
+@pytest.mark.parametrize("failure_kind", ["publisher", "factory"])
+def test_exit_failures_still_cleanup_super_and_are_idempotent(
+    state_types, failure_kind,
+):
+    harness = StateHarness(state_types)
+    try:
+        harness.enter_live(epoch=71, newest_frame=110)
+        before_attempts = len(harness.publish_attempts)
+        factory_calls = []
+        if failure_kind == "publisher":
+            harness.ctx.ros_node.publisher.failures.append(
+                RuntimeError("exit publish failed")
+            )
+        else:
+            def failed_factory():
+                factory_calls.append(None)
+                raise RuntimeError("exit factory failed")
+
+            harness.state._command_id_factory = failed_factory
+
+        harness.state._gripper_session_active = True
+        harness.state._gripper_armed = True
+        harness.state._stale_sides.add("left")
+        harness.state.on_exit(harness.ctx)
+
+        expected_attempts = before_attempts + (
+            1 if failure_kind == "publisher" else 0
+        )
+        assert len(harness.publish_attempts) == expected_attempts
+        assert len(factory_calls) == (1 if failure_kind == "factory" else 0)
+        assert not harness.state.is_entered
+        assert not harness.policy.live_reference_gate_open
+        assert not harness.state.arm_pending
+        assert not harness.state.disarm_pending
+        assert not harness.state.neutral_latch_open
+        assert not harness.state._gripper_session_active
+        assert not harness.state._gripper_armed
+        assert harness.state._stale_sides == set()
+
+        harness.state.on_exit(harness.ctx)
+        assert len(harness.publish_attempts) == expected_attempts
+        assert len(factory_calls) == (1 if failure_kind == "factory" else 0)
+    finally:
+        harness.ctx.ros_node.publisher.failures.clear()
+        harness.state._command_id_factory = lambda: 901
+        harness.entered = False
+        harness.close()
+
+
 def test_operator_prompts_are_exact_and_reason_scoped(state_harness):
     initial_prompt = (
         "Xsens READY — release controls, then press LT+RT+Y to request LIVE"
@@ -1047,3 +1450,100 @@ def test_operator_prompts_are_exact_and_reason_scoped(state_harness):
     assert state_harness.logger.infos.count(rearm_prompt) == 1
     state_harness.tick()
     assert state_harness.logger.infos.count(rearm_prompt) == 1
+
+
+def test_initial_prompt_uses_eligibility_rising_edge_not_diagnostic_key(
+    state_harness,
+):
+    prompt = (
+        "Xsens READY — release controls, then press LT+RT+Y to request LIVE"
+    )
+    state_harness.enter_with_slot(0)
+    state_harness.publish_status(
+        sequence=1, epoch=71, accepted=0, ready=False,
+        reference_window_ready=False, ready_frames=0,
+    )
+    state_harness.tick()
+    state_harness.complete_entry_disarm(epoch=71, sequence=2)
+
+    state_harness.publish_status(
+        sequence=3, epoch=71, accepted=0, newest_frame=109,
+        ready=True, reference_window_ready=True, ready_frames=30,
+    )
+    state_harness.tick()
+    assert state_harness.logger.infos.count(prompt) == 0
+
+    state_harness.publish_reference(epoch=71, newest_frame=109)
+    state_harness.tick()
+    assert state_harness.logger.infos.count(prompt) == 1
+
+    snapshot = state_harness.policy.poll_source_snapshot()
+    state_harness.policy._source_blend_active = True
+    state_harness.state._emit_phase_diagnostic(
+        snapshot, state_harness.clock.monotonic()
+    )
+    state_harness.policy._source_blend_active = False
+    state_harness.state._emit_phase_diagnostic(
+        snapshot, state_harness.clock.monotonic()
+    )
+    assert state_harness.logger.infos.count(prompt) == 1
+
+    state_harness.publish_status(
+        sequence=4, epoch=71, accepted=0, newest_frame=109,
+        ready=False, reference_window_ready=False, ready_frames=0,
+    )
+    state_harness.tick()
+    state_harness.publish_status(
+        sequence=5, epoch=71, accepted=0, newest_frame=109,
+        ready=True, reference_window_ready=True, ready_frames=30,
+    )
+    state_harness.tick()
+    assert state_harness.logger.infos.count(prompt) == 2
+
+
+def test_rearm_prompt_uses_eligibility_rising_edge_not_diagnostic_key(
+    state_harness,
+):
+    prompt = (
+        "Xsens new session READY — release controls, then press LT+RT+Y to re-arm"
+    )
+    initial_prompt = (
+        "Xsens READY — release controls, then press LT+RT+Y to request LIVE"
+    )
+    state_harness.enter_live(epoch=71, newest_frame=110)
+    state_harness.change_epoch(epoch=72, sequence=1)
+
+    state_harness.publish_status(
+        sequence=2, epoch=72, accepted=0, newest_frame=209,
+        ready=True, reference_window_ready=True, ready_frames=30,
+    )
+    state_harness.tick()
+    assert state_harness.logger.infos.count(prompt) == 0
+
+    state_harness.publish_reference(epoch=72, newest_frame=209)
+    state_harness.tick()
+    assert state_harness.logger.infos.count(prompt) == 1
+    assert state_harness.logger.infos.count(initial_prompt) == 1
+
+    snapshot = state_harness.policy.poll_source_snapshot()
+    state_harness.policy._source_blend_active = True
+    state_harness.state._emit_phase_diagnostic(
+        snapshot, state_harness.clock.monotonic()
+    )
+    state_harness.policy._source_blend_active = False
+    state_harness.state._emit_phase_diagnostic(
+        snapshot, state_harness.clock.monotonic()
+    )
+    assert state_harness.logger.infos.count(prompt) == 1
+
+    state_harness.publish_status(
+        sequence=3, epoch=72, accepted=0, newest_frame=209,
+        ready=False, reference_window_ready=False, ready_frames=0,
+    )
+    state_harness.tick()
+    state_harness.publish_status(
+        sequence=4, epoch=72, accepted=0, newest_frame=209,
+        ready=True, reference_window_ready=True, ready_frames=30,
+    )
+    state_harness.tick()
+    assert state_harness.logger.infos.count(prompt) == 2

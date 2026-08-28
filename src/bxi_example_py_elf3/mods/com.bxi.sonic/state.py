@@ -633,8 +633,11 @@ class XsensSonicTeleopState(SonicTeleopState):
     @property
     def disarm_pending(self) -> bool:
         return (
-            self._pending_request is not None
-            and self._pending_request.requested_arm_epoch == 0
+            self._disarm_retry_epoch is not None
+            or (
+                self._pending_request is not None
+                and self._pending_request.requested_arm_epoch == 0
+            )
         )
 
     @property
@@ -691,41 +694,53 @@ class XsensSonicTeleopState(SonicTeleopState):
         self._ready_frames = 0
         self._rearm_ready = False
         self._pending_request = None
+        self._disarm_retry_epoch = None
         self._neutral_latch_open = False
         self._latest_status = None
         self._latest_status_sequence = 0
         self._entered = False
         self._diagnostic_key = None
+        self._prompt_eligibility = None
         self._recovery_frame_index = None
 
     def on_enter(self, ctx: RobotControlContext) -> None:
         self._entered = True
-        self._neutral_latch_open = (
+        self._neutral_latch_open = self._runtime_exact_zero(
             ctx.remote_slot_value(self.manual_enable_slot)
-            == self.manual_enable_neutral_value
         )
         self.logger.info(f"SONIC Xsens遥操已启动；{self.operator_prompt}")
 
     def on_exit(self, ctx: RobotControlContext) -> None:
-        now = self._monotonic()
-        if self._current_source_epoch is not None:
-            self._publish_command(
-                target_source_epoch=self._current_source_epoch,
-                requested_arm_epoch=0,
-                pre_status_sequence=self._latest_status_sequence,
-                now=now,
-            )
-        self.policy.close_live_reference_gate(
-            hold_last_reference=False,
-            rearm_required=False,
-        )
-        self._pending_request = None
-        self._neutral_latch_open = False
+        was_entered = self._entered
         self._entered = False
-        super().on_exit(ctx)
+        try:
+            if was_entered and self._current_source_epoch is not None:
+                try:
+                    self._publish_command(
+                        target_source_epoch=self._current_source_epoch,
+                        requested_arm_epoch=0,
+                        pre_status_sequence=self._latest_status_sequence,
+                        now=self._monotonic(),
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        f"Xsens exit disarm failed: {exc!r}"
+                    )
+        finally:
+            try:
+                self.policy.close_live_reference_gate(
+                    hold_last_reference=False,
+                    rearm_required=False,
+                )
+            finally:
+                self._pending_request = None
+                self._disarm_retry_epoch = None
+                self._neutral_latch_open = False
+                self._prompt_eligibility = None
+                super().on_exit(ctx)
 
     def _draw_command_id(self) -> int:
-        while True:
+        for _ in range(32):
             candidate = self._command_id_factory()
             if isinstance(candidate, bool):
                 continue
@@ -736,6 +751,7 @@ class XsensSonicTeleopState(SonicTeleopState):
             if 0 < value < 2**63 and value not in self._issued_command_ids:
                 self._issued_command_ids.add(value)
                 return value
+        raise RuntimeError("failed to draw a unique command ID in 32 attempts")
 
     def _publish_command(
         self,
@@ -744,7 +760,7 @@ class XsensSonicTeleopState(SonicTeleopState):
         requested_arm_epoch: int,
         pre_status_sequence: int,
         now: float,
-    ) -> PendingArmRequest:
+    ) -> PendingArmRequest | None:
         command_id = self._draw_command_id()
         message = Int64MultiArray()
         message.layout.dim = []
@@ -754,13 +770,63 @@ class XsensSonicTeleopState(SonicTeleopState):
             int(target_source_epoch),
             int(requested_arm_epoch),
         ]
-        self._arm_command_publisher.publish(message)
+        try:
+            self._arm_command_publisher.publish(message)
+        except Exception as exc:
+            self.logger.warning(
+                "Xsens command publish failed "
+                f"command_id={command_id} target={target_source_epoch} "
+                f"requested={requested_arm_epoch}: {exc!r}"
+            )
+            return None
         return PendingArmRequest(
             command_id=command_id,
             target_source_epoch=int(target_source_epoch),
             requested_arm_epoch=int(requested_arm_epoch),
             pre_status_sequence=int(pre_status_sequence),
             deadline_monotonic=now + self.arm_ack_timeout_s,
+        )
+
+    def _request_disarm(
+        self,
+        *,
+        target_source_epoch: int,
+        pre_status_sequence: int,
+        now: float,
+    ) -> bool:
+        epoch = int(target_source_epoch)
+        self._pending_request = None
+        self._disarm_retry_epoch = epoch
+        request = self._publish_command(
+            target_source_epoch=epoch,
+            requested_arm_epoch=0,
+            pre_status_sequence=pre_status_sequence,
+            now=now,
+        )
+        if request is None:
+            return False
+        self._pending_request = request
+        self._disarm_retry_epoch = None
+        return True
+
+    def _retry_disarm(
+        self,
+        snapshot: JoinedSourceSnapshot,
+        now: float,
+    ) -> None:
+        epoch = self._disarm_retry_epoch
+        if epoch is None:
+            return
+        status = snapshot.status
+        pre_status_sequence = (
+            self._latest_status_sequence
+            if status is None
+            else status.status_sequence
+        )
+        self._request_disarm(
+            target_source_epoch=epoch,
+            pre_status_sequence=pre_status_sequence,
+            now=now,
         )
 
     @staticmethod
@@ -776,8 +842,17 @@ class XsensSonicTeleopState(SonicTeleopState):
             and status.accepted_arm_epoch == request.requested_arm_epoch
         )
 
-    def _observe_manual_slot(self, value: int) -> None:
-        if value == self.manual_enable_neutral_value:
+    @staticmethod
+    def _runtime_exact_zero(value: object) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            return operator.index(value) == 0
+        except TypeError:
+            return False
+
+    def _observe_manual_slot(self, value: object) -> None:
+        if self._runtime_exact_zero(value):
             self._neutral_latch_open = True
 
     def _status_health(
@@ -863,15 +938,15 @@ class XsensSonicTeleopState(SonicTeleopState):
         self._rearm_ready = False
         self._recovery_frame_index = None
         self._pending_request = None
+        self._disarm_retry_epoch = None
         if self._current_source_epoch is None:
             self._current_source_epoch = epoch
             self._pending_source_epoch = None
             self._phase = XsensPhase.WAITING_FOR_DATA
             self._link_status = None
             self._hold_cause = None
-            self._pending_request = self._publish_command(
+            self._request_disarm(
                 target_source_epoch=epoch,
-                requested_arm_epoch=0,
                 pre_status_sequence=status.status_sequence,
                 now=now,
             )
@@ -885,12 +960,18 @@ class XsensSonicTeleopState(SonicTeleopState):
                 hold_last_reference=True,
                 rearm_required=True,
             )
-            return
-        self._current_source_epoch = epoch
-        self._pending_source_epoch = None
-        self._phase = XsensPhase.WAITING_FOR_DATA
-        self._link_status = None
-        self._hold_cause = None
+        else:
+            self._current_source_epoch = epoch
+            self._pending_source_epoch = None
+            self._phase = XsensPhase.WAITING_FOR_DATA
+            self._link_status = None
+            self._hold_cause = None
+        if status.accepted_arm_epoch != 0:
+            self._request_disarm(
+                target_source_epoch=epoch,
+                pre_status_sequence=status.status_sequence,
+                now=now,
+            )
 
     def _advance_waiting_or_ready(
         self,
@@ -1088,12 +1169,15 @@ class XsensSonicTeleopState(SonicTeleopState):
             if self._link_status is XsensLinkStatus.HOLD_REARM_REQUIRED
             else self._current_source_epoch
         )
-        if (
+        epoch_changed = bool(
             status is not None
             and status.source_epoch > 0
             and status.source_epoch != expected_epoch
-        ):
+        )
+        if epoch_changed:
             self._accept_epoch_edge(snapshot, now)
+        elif self._disarm_retry_epoch is not None:
+            self._retry_disarm(snapshot, now)
 
         request = self._pending_request
         if (
@@ -1127,9 +1211,8 @@ class XsensSonicTeleopState(SonicTeleopState):
             if status is None
             else status.status_sequence
         )
-        self._pending_request = self._publish_command(
+        self._request_disarm(
             target_source_epoch=request.target_source_epoch,
-            requested_arm_epoch=0,
             pre_status_sequence=pre_status_sequence,
             now=now,
         )
@@ -1224,12 +1307,14 @@ class XsensSonicTeleopState(SonicTeleopState):
             return True
 
         assert snapshot.status is not None
-        self._pending_request = self._publish_command(
+        request = self._publish_command(
             target_source_epoch=epoch,
             requested_arm_epoch=epoch,
             pre_status_sequence=snapshot.status.status_sequence,
             now=now,
         )
+        if request is not None:
+            self._pending_request = request
         return True
 
     def on_update(self, ctx: RobotControlContext, dt: float) -> None:
@@ -1256,9 +1341,35 @@ class XsensSonicTeleopState(SonicTeleopState):
         snapshot: JoinedSourceSnapshot,
         now: float,
     ) -> None:
+        eligibility = None
+        if (
+            self._phase is XsensPhase.READY
+            and self._pending_request is None
+            and not self.disarm_pending
+        ):
+            eligibility = ("initial", self._current_source_epoch)
+        elif (
+            self._phase is XsensPhase.LIVE
+            and self._link_status is XsensLinkStatus.HOLD_REARM_REQUIRED
+            and self._rearm_ready
+            and self._pending_request is None
+            and not self.disarm_pending
+        ):
+            eligibility = ("rearm", self._pending_source_epoch)
+        if eligibility != self._prompt_eligibility:
+            self._prompt_eligibility = eligibility
+            if eligibility is not None:
+                self.logger.info(
+                    XSENS_READY_PROMPT
+                    if eligibility[0] == "initial"
+                    else XSENS_REARM_READY_PROMPT
+                )
+
         request = self._pending_request
         pending_kind = (
-            None
+            "disarm"
+            if self._disarm_retry_epoch is not None
+            else None
             if request is None
             else "disarm"
             if request.requested_arm_epoch == 0
@@ -1277,15 +1388,6 @@ class XsensSonicTeleopState(SonicTeleopState):
         if key == self._diagnostic_key:
             return
         self._diagnostic_key = key
-        if self._phase is XsensPhase.READY and request is None:
-            self.logger.info(XSENS_READY_PROMPT)
-        elif (
-            self._phase is XsensPhase.LIVE
-            and self._link_status is XsensLinkStatus.HOLD_REARM_REQUIRED
-            and self._rearm_ready
-            and request is None
-        ):
-            self.logger.info(XSENS_REARM_READY_PROMPT)
 
         status = snapshot.status
         status_age = (
