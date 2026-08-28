@@ -328,6 +328,17 @@ actions:
 
 def test_existing_pico_and_zerolab_manifest_sections_are_unchanged():
     manifest = load_manifest()
+    xsens_routes = [
+        route for route in manifest["routes"]
+        if "sonic_xsens" in (route["from"], route["to"])
+        or route["event"] == "activate_xsens"
+    ]
+    xsens_actions = [
+        action for action in manifest["actions"]
+        if action["from"] == "sonic_xsens"
+        or action["event"] == "activate_xsens"
+        or action["action"] == "activate_xsens"
+    ]
     actual = {
         "nodes": {
             name: manifest["nodes"][name]
@@ -343,15 +354,57 @@ def test_existing_pico_and_zerolab_manifest_sections_are_unchanged():
             name: manifest["states"][name]
             for name in ("sonic_teleop", "sonic_zerolab")
         },
-        "routes": [
-            route for route in manifest["routes"]
-            if route["from"] != "sonic_xsens"
-            and route["to"] != "sonic_xsens"
-            and route["event"] != "activate_xsens"
-        ],
-        "actions": [
-            action for action in manifest["actions"]
-            if action["from"] != "sonic_xsens"
-        ],
+        "routes": [route for route in manifest["routes"] if route not in xsens_routes],
+        "actions": [action for action in manifest["actions"] if action not in xsens_actions],
     }
     assert actual == LEGACY_MANIFEST_SNAPSHOT
+    assert {yaml.safe_dump(route, sort_keys=True) for route in xsens_routes} == {
+        yaml.safe_dump(route, sort_keys=True)
+        for route in [
+            {
+                "from": "com.bxi.basic_actions/normal",
+                "event": "activate_xsens",
+                "to": "sonic_xsens",
+                "transition": "soft_switch",
+            },
+            {
+                "from": "sonic_xsens",
+                "event": "com.bxi.basic_actions/normal",
+                "to": "com.bxi.basic_actions/normal",
+                "transition": "soft_switch",
+            },
+            {
+                "from": "sonic_xsens",
+                "event": "com.bxi.basic_actions/zero_torque",
+                "to": "com.bxi.basic_actions/zero_torque",
+            },
+            {
+                "from": "sonic_xsens",
+                "event": "com.bxi.basic_actions/pd_brake",
+                "to": "com.bxi.basic_actions/pd_brake",
+            },
+            {
+                "from": "sonic_xsens",
+                "event": "com.bxi.basic_actions/recover",
+                "to": "com.bxi.basic_actions/recover",
+                "transition": "soft_switch",
+            },
+        ]
+    }
+    assert {yaml.safe_dump(action, sort_keys=True) for action in xsens_actions} == {
+        yaml.safe_dump(action, sort_keys=True)
+        for action in [
+            {
+                "from": "sonic_xsens",
+                "event": "activate_xsens",
+                "action": "activate_xsens",
+                "manifest": {"label": "请求Xsens实时控制", "ui": "play_arrow"},
+            },
+            {
+                "from": "sonic_xsens",
+                "event": "reset_alignment",
+                "action": "reset_alignment",
+                "manifest": {"label": "重置朝向对齐", "ui": "refresh"},
+            },
+        ]
+    }

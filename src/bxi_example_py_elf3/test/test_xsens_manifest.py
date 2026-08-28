@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import importlib
 import runpy
 from pathlib import Path
@@ -21,6 +22,31 @@ from bxi_example_py_elf3.framework.runtime.resource_manager import ResourceManag
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 MOD_ROOT = PACKAGE_ROOT / "mods" / "com.bxi.sonic"
 CONFIG_PATH = PACKAGE_ROOT / "config" / "elf3_state_machine.yaml"
+LIVE_SOURCE_STATES = {"sonic_teleop", "sonic_zerolab", "sonic_xsens"}
+NORMAL_STATE = "com.bxi.basic_actions/normal"
+APPROVED_XSENS_ROUTES = frozenset({
+    (("event", "activate_xsens"), ("from", NORMAL_STATE),
+     ("to", "sonic_xsens"), ("transition", "soft_switch")),
+    (("event", NORMAL_STATE), ("from", "sonic_xsens"),
+     ("to", NORMAL_STATE), ("transition", "soft_switch")),
+    (("event", "com.bxi.basic_actions/zero_torque"),
+     ("from", "sonic_xsens"),
+     ("to", "com.bxi.basic_actions/zero_torque")),
+    (("event", "com.bxi.basic_actions/pd_brake"),
+     ("from", "sonic_xsens"),
+     ("to", "com.bxi.basic_actions/pd_brake")),
+    (("event", "com.bxi.basic_actions/recover"),
+     ("from", "sonic_xsens"),
+     ("to", "com.bxi.basic_actions/recover"), ("transition", "soft_switch")),
+})
+APPROVED_XSENS_ACTIONS = frozenset({
+    (("action", "activate_xsens"), ("event", "activate_xsens"),
+     ("from", "sonic_xsens"),
+     ("manifest", (("label", "请求Xsens实时控制"), ("ui", "play_arrow")))),
+    (("action", "reset_alignment"), ("event", "reset_alignment"),
+     ("from", "sonic_xsens"),
+     ("manifest", (("label", "重置朝向对齐"), ("ui", "refresh")))),
+})
 
 
 @pytest.fixture
@@ -265,24 +291,122 @@ def test_xsens_has_reset_alignment_action(manifest):
 
 
 def test_live_source_states_have_no_direct_cross_routes(manifest):
-    live_states = {"sonic_teleop", "sonic_zerolab", "sonic_xsens"}
     assert not [
         route for route in manifest["routes"]
-        if route["from"] in live_states
-        and route["to"] in live_states
+        if route["from"] in LIVE_SOURCE_STATES
+        and route["to"] in LIVE_SOURCE_STATES
         and route["from"] != route["to"]
     ]
     entries = {
         (route["event"], route["to"])
         for route in manifest["routes"]
-        if route["from"] == "com.bxi.basic_actions/normal"
-        and route["to"] in live_states
+        if route["from"] == NORMAL_STATE
+        and route["to"] in LIVE_SOURCE_STATES
     }
     assert entries == {
         ("activate", "sonic_teleop"),
         ("activate_zerolab", "sonic_zerolab"),
         ("activate_xsens", "sonic_xsens"),
     }
+
+
+def _freeze_manifest_value(value):
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (key, _freeze_manifest_value(item)) for key, item in value.items()
+        ))
+    if isinstance(value, list):
+        return tuple(_freeze_manifest_value(item) for item in value)
+    return value
+
+
+def _xsens_routes(manifest):
+    return [
+        route for route in manifest["routes"]
+        if "sonic_xsens" in (route["from"], route["to"])
+        or route["event"] == "activate_xsens"
+    ]
+
+
+def _xsens_actions(manifest):
+    return [
+        action for action in manifest["actions"]
+        if action["from"] == "sonic_xsens"
+        or action["event"] == "activate_xsens"
+        or action["action"] == "activate_xsens"
+    ]
+
+
+def _assert_approved_xsens_wiring(manifest):
+    live_state_entries = [
+        route for route in manifest["routes"]
+        if route["to"] in LIVE_SOURCE_STATES
+    ]
+    assert live_state_entries
+    assert {route["from"] for route in live_state_entries} == {NORMAL_STATE}
+    assert {
+        _freeze_manifest_value(route) for route in _xsens_routes(manifest)
+    } == APPROVED_XSENS_ROUTES
+    assert {
+        _freeze_manifest_value(action) for action in _xsens_actions(manifest)
+    } == APPROVED_XSENS_ACTIONS
+
+
+def test_xsens_wiring_routes_and_actions_match_the_approved_manifest(manifest):
+    _assert_approved_xsens_wiring(manifest)
+
+
+def _legacy_live_source_route_predicates_accept(manifest):
+    no_direct_cross_routes = not [
+        route for route in manifest["routes"]
+        if route["from"] in LIVE_SOURCE_STATES
+        and route["to"] in LIVE_SOURCE_STATES
+        and route["from"] != route["to"]
+    ]
+    normal_entries = {
+        (route["event"], route["to"])
+        for route in manifest["routes"]
+        if route["from"] == NORMAL_STATE
+        and route["to"] in LIVE_SOURCE_STATES
+    }
+    return no_direct_cross_routes and normal_entries == {
+        ("activate", "sonic_teleop"),
+        ("activate_zerolab", "sonic_zerolab"),
+        ("activate_xsens", "sonic_xsens"),
+    }
+
+
+def test_exact_xsens_wiring_invariants_reject_reviewer_mutations(manifest):
+    mutated = deepcopy(manifest)
+    mutated["routes"].append({
+        "from": "com.bxi.basic_actions/zero_torque",
+        "event": "activate_xsens",
+        "to": "sonic_xsens",
+        "transition": "soft_switch",
+    })
+    assert _legacy_live_source_route_predicates_accept(mutated)
+    with pytest.raises(AssertionError):
+        _assert_approved_xsens_wiring(mutated)
+
+    extra_route = deepcopy(manifest)
+    extra_route["routes"].append({
+        "from": NORMAL_STATE,
+        "event": "activate_xsens_fallback",
+        "to": "sonic_xsens",
+        "transition": "soft_switch",
+    })
+    with pytest.raises(AssertionError):
+        _assert_approved_xsens_wiring(extra_route)
+
+    extra_action = deepcopy(manifest)
+    extra_action["actions"].append({
+        "from": "sonic_xsens",
+        "event": "activate_xsens_diagnostic",
+        "action": "activate_xsens_diagnostic",
+        "manifest": {"label": "Xsens诊断", "ui": "bug_report"},
+    })
+    with pytest.raises(AssertionError):
+        _assert_approved_xsens_wiring(extra_action)
 
 
 def test_xsens_cannot_be_the_initial_state_without_prepare_seed(manifest):
