@@ -4,9 +4,22 @@ from collections import deque
 from dataclasses import replace
 import socket
 import struct
-from typing import TYPE_CHECKING
+from threading import Event, Lock
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
+
+from bxi_example_py_elf3.framework.inference import InferenceFrame
+from bxi_example_py_elf3.framework.joints import JointStateView
+from pico.zmq_messages import pack_pose_message
+from policy import (
+    MODEL_INPUT_DIM,
+    SMPL_ROOT_ORI_START,
+    SMPL_TOKENIZER_DIM,
+    SONIC_PARAMETERS,
+    SmplReferenceFrame,
+    SonicTeleopPolicy,
+)
 
 
 if TYPE_CHECKING:
@@ -399,3 +412,192 @@ def axis_angle_wxyz(axis: int, degrees: float) -> np.ndarray:
     value[0] = np.cos(np.deg2rad(degrees) / 2.0)
     value[axis + 1] = np.sin(np.deg2rad(degrees) / 2.0)
     return value
+
+
+def make_reference(
+    *,
+    epoch: int | None = 71,
+    newest_frame: int | None = 109,
+    source_ready: bool = True,
+    producer_monotonic_ns: int | None = 1_000_000_000,
+    row_marker: float | Sequence[float] = 0.0,
+    root_yaw_rad: float = 0.0,
+    with_anchor: bool = True,
+) -> SmplReferenceFrame:
+    marker = np.asarray(row_marker, dtype=np.float32)
+    if marker.ndim == 0:
+        marker = np.repeat(marker.reshape(1), 10)
+    marker = marker.reshape(10)
+    term = np.repeat(marker[:, None], 72, axis=1).astype(np.float32)
+    wrist = np.repeat(marker[:, None], 6, axis=1).astype(np.float32)
+    root = np.zeros((10, 4), dtype=np.float32)
+    root[:, 0] = np.cos(root_yaw_rad / 2.0)
+    root[:, 3] = np.sin(root_yaw_rad / 2.0)
+    anchor = root.copy() if with_anchor else None
+    return SmplReferenceFrame(
+        term1_local=term,
+        root_quat=root,
+        wrist=wrist,
+        anchor_quat=anchor,
+        frame_index=-1 if newest_frame is None else int(newest_frame) - 9,
+        sequence=1,
+        source_ready=bool(source_ready),
+        producer_monotonic_ns=producer_monotonic_ns,
+        source_epoch=epoch,
+        source_newest_frame_index=newest_frame,
+        received_monotonic=0.0,
+    )
+
+
+def make_inference_frame(qpos_offset: float = 0.0) -> InferenceFrame:
+    position = (
+        SONIC_PARAMETERS.default_position.astype(np.float32)
+        + np.float32(qpos_offset)
+    )
+    joints = JointStateView(
+        SONIC_PARAMETERS.layout,
+        position.copy(),
+        np.zeros(29, dtype=np.float32),
+    )
+    return InferenceFrame(
+        joints=joints,
+        quat_wxyz=np.array([1, 0, 0, 0], dtype=np.float32),
+        angular_velocity=np.zeros(3, dtype=np.float32),
+    )
+
+
+class DeterministicBackend:
+    def run(self, inputs: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+        observation = np.asarray(inputs["obs_dict"], dtype=np.float32)
+        human = float(np.mean(observation[0, :720]))
+        root = float(observation[0, SMPL_ROOT_ORI_START + 1])
+        proprio = float(np.mean(observation[0, SMPL_TOKENIZER_DIM:]))
+        signal = 0.01 * human + 0.25 * root + 0.01 * proprio
+        return {
+            "action": np.full(
+                (1, 29),
+                np.tanh(signal) * np.float32(0.1),
+                dtype=np.float32,
+            )
+        }
+
+    def close(self) -> None:
+        pass
+
+
+class TestableSonicPolicy(SonicTeleopPolicy):
+    __test__ = False
+
+    @property
+    def pending_yaw_offset(self) -> float | None:
+        return self._pending_yaw_offset
+
+    @pending_yaw_offset.setter
+    def pending_yaw_offset(self, value: float | None) -> None:
+        self._pending_yaw_offset = value
+
+    def _load_stream_reference(self) -> None:
+        rows = 3520
+        self.ref_term1 = np.zeros((rows, 72), np.float32)
+        self.ref_root_quat = np.zeros((rows, 4), np.float32)
+        self.ref_root_quat[:, 0] = 1.0
+        self.ref_wrist = np.zeros((rows, 6), np.float32)
+        self.ref_anchor_quat = None
+
+    def _init_backend(self, backend: str) -> None:
+        self._backend = DeterministicBackend()
+        self.input_buffer = np.zeros((1, MODEL_INPUT_DIM), np.float32)
+        self._inputs = {"obs_dict": self.input_buffer}
+
+    def _init_zmq(self) -> None:
+        self._message_lock = Lock()
+        self._reference_messages = deque(maxlen=64)
+        self._status_messages = deque(maxlen=64)
+        self._zmq_stop = Event()
+        self._zmq_thread = None
+
+    def inject_status(
+        self,
+        fields: Mapping[str, np.ndarray],
+        received_mono: float | None = None,
+    ) -> None:
+        received = (
+            self._monotonic() if received_mono is None else received_mono
+        )
+        message = pack_pose_message(fields, topic=self.xsens_status_zmq_topic)
+        with self._message_lock:
+            self._status_messages.append((message, float(received)))
+
+    def inject_reference(
+        self,
+        reference: SmplReferenceFrame,
+        received_mono: float | None = None,
+    ) -> None:
+        received = (
+            self._monotonic() if received_mono is None else received_mono
+        )
+        fields = {
+            "term1_local": reference.term1_local,
+            "root_quat": reference.root_quat,
+            "wrist": reference.wrist,
+            "frame_index": np.array([reference.frame_index], np.int64),
+            "source_ready": np.array([reference.source_ready], np.bool_),
+        }
+        if reference.producer_monotonic_ns is not None:
+            fields["producer_monotonic_ns"] = np.array(
+                [reference.producer_monotonic_ns], np.int64
+            )
+        if reference.source_epoch is not None:
+            fields["source_epoch"] = np.array(
+                [reference.source_epoch], np.int64
+            )
+        if reference.source_newest_frame_index is not None:
+            fields["source_newest_frame_index"] = np.array(
+                [reference.source_newest_frame_index], np.int64
+            )
+        if reference.anchor_quat is not None:
+            fields["anchor_quat"] = reference.anchor_quat
+        message = pack_pose_message(fields, topic=self.smpl_ref_zmq_topic)
+        with self._message_lock:
+            self._reference_messages.append((message, float(received)))
+
+
+class CaptureLogger:
+    def __init__(self) -> None:
+        self.infos = []
+        self.warnings = []
+        self.events = []
+
+    def info(self, message) -> None:
+        self.infos.append(str(message))
+        self.events.append(("info", str(message)))
+
+    def warning(self, message) -> None:
+        self.warnings.append(str(message))
+        self.events.append(("warning", str(message)))
+
+
+class PolicyHarness:
+    def __init__(self) -> None:
+        self.clock = FakeClock(1_000_000_000)
+        self.policy = TestableSonicPolicy(
+            "unused.onnx",
+            "unused.npz",
+            use_smpl_ref_zmq=True,
+            monotonic=self.clock.monotonic,
+            monotonic_ns=self.clock.monotonic_ns,
+        )
+        self.policy.test_clock = self.clock
+        self.policy.bind_logger(CaptureLogger())
+        self.policy.configure_runtime(
+            yaw_bias_rad=np.pi / 2,
+            live_ref_timeout_s=0.5,
+            idle_frame_start=3509,
+            source_blend_duration_s=0.4,
+            source_kind="xsens",
+            status_timeout_s=0.2,
+        )
+        self.policy.reset(make_inference_frame())
+
+    def close(self) -> None:
+        self.policy.close()
