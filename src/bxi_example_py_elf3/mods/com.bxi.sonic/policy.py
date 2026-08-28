@@ -14,7 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Literal, Mapping, Optional
 
 import numpy as np
 import zmq
@@ -57,6 +57,16 @@ DEFAULT_IDLE_FRAME_START = 3509
 
 MonotonicSeconds = Callable[[], float]
 MonotonicNanoseconds = Callable[[], int]
+
+SourceBlendKind = Literal[
+    "idle_to_live",
+    "live_to_hold",
+    "hold_to_live",
+    "hold_to_rearm",
+    "source_change",
+    "alignment",
+]
+AlignmentContext = Literal["fresh", "same_epoch_hold", "rearm_hold"]
 
 SMPL_JOINTS_START = 0
 SMPL_ROOT_ORI_START = 720
@@ -120,6 +130,31 @@ class SmplReferenceFrame:
     source_epoch: int | None = None
     source_newest_frame_index: int | None = None
     received_monotonic: float = 0.0
+
+
+def _static_last_row(frame: SmplReferenceFrame) -> SmplReferenceFrame:
+    def tile(values: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(
+            np.repeat(values[-1:], 10, axis=0), dtype=np.float32
+        )
+
+    return SmplReferenceFrame(
+        term1_local=tile(frame.term1_local),
+        root_quat=tile(frame.root_quat),
+        wrist=tile(frame.wrist),
+        anchor_quat=(
+            tile(frame.anchor_quat)
+            if frame.anchor_quat is not None
+            else None
+        ),
+        frame_index=frame.frame_index,
+        sequence=frame.sequence,
+        source_ready=frame.source_ready,
+        producer_monotonic_ns=frame.producer_monotonic_ns,
+        source_epoch=frame.source_epoch,
+        source_newest_frame_index=frame.source_newest_frame_index,
+        received_monotonic=frame.received_monotonic,
+    )
 
 
 @dataclass(frozen=True)
@@ -439,9 +474,20 @@ class SonicTeleopPolicy(JointPolicy):
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
         self.reference_source: Optional[str] = None
-        self.source_blend_from = self.default_dof_pos.copy()
-        self.source_blend_started_at = 0.0
-        self.source_blend_active = False
+        self.active_yaw_offset = 0.0
+        self.hold_yaw_offset = 0.0
+        self._pending_yaw_offset: float | None = None
+        self._pending_yaw_epoch: int | None = None
+        self._held_reference: SmplReferenceFrame | None = None
+        self._selected_reference: SmplReferenceFrame | None = None
+        self._selected_yaw_offset = 0.0
+        self._last_robot_anchor = np.array(
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+        )
+        self._source_blend_from = self.default_dof_pos.copy()
+        self._source_blend_started_at = 0.0
+        self._source_blend_active = False
+        self._source_blend_kind: SourceBlendKind | None = None
         self.source_transition_from: Optional[str] = None
         self.policy_active = False
         self.last_status = "not_started"
@@ -455,6 +501,30 @@ class SonicTeleopPolicy(JointPolicy):
 
     def bind_logger(self, logger: LoggerLike) -> None:
         self._logger = logger
+
+    @property
+    def held_reference(self) -> SmplReferenceFrame | None:
+        return self._held_reference
+
+    @property
+    def selected_reference(self) -> SmplReferenceFrame | None:
+        return self._selected_reference
+
+    @property
+    def pending_yaw_offset(self) -> float | None:
+        return self._pending_yaw_offset
+
+    @property
+    def source_blend_active(self) -> bool:
+        return self._source_blend_active
+
+    @property
+    def source_blend_started_at(self) -> float:
+        return self._source_blend_started_at
+
+    @property
+    def source_blend_from(self) -> np.ndarray:
+        return self._source_blend_from.copy()
 
     def _validate_runtime_config(self) -> None:
         if not math.isfinite(self.yaw_bias_rad):
@@ -665,31 +735,36 @@ class SonicTeleopPolicy(JointPolicy):
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
         self.reference_source = None
-        self.source_blend_from = self.default_dof_pos.copy()
-        self.source_blend_started_at = 0.0
-        self.source_blend_active = False
-        self.source_transition_from = None
-        self.policy_active = False
-        self.last_status = "reset"
-        self._reported_status = None
+        self._held_reference = None
+        self._selected_reference = None
+        self._selected_yaw_offset = 0.0
+        self._last_robot_anchor = np.array(
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+        )
+        self.active_yaw_offset = 0.0
+        self.hold_yaw_offset = 0.0
+        self._pending_yaw_offset = None
+        self._pending_yaw_epoch = None
+        self._latest_authorized_reference = None
         self.live_reference_gate_open = False
         self.armed_source_epoch = None
         self.minimum_source_frame_index = None
         self._gate_rearm_required = False
         self._gate_reset_yaw_requested = False
         self._gate_hold_requested = False
-        self.pending_yaw_offset = None
-        self._latest_authorized_reference = None
         self._source_progress_epoch = None
         self._source_progress_status_sequence = None
         self._source_progress_frame_index = None
+        target = measured if seed_target_from_robot else self.default_dof_pos
+        self._source_blend_from = np.asarray(target, np.float32).copy()
+        self._source_blend_started_at = 0.0
+        self._source_blend_active = False
+        self._source_blend_kind = None
+        self.source_transition_from = None
+        self.policy_active = False
+        self.last_status = "reset"
+        self._reported_status = None
         self._drain_source_queues()
-
-        target = (
-            measured
-            if seed_target_from_robot
-            else self.default_dof_pos
-        )
         np.copyto(self.target_dof_pos, target)
         self.publish_output(self.target_dof_pos, self.kps, self.kds)
 
@@ -1116,6 +1191,21 @@ class SonicTeleopPolicy(JointPolicy):
         self._advance_source_progress(status, reference)
         return True
 
+    def _capture_hold_if_needed(self) -> None:
+        if self._held_reference is not None:
+            return
+        reference = self._latest_authorized_reference
+        if reference is None:
+            return
+        self._held_reference = _static_last_row(reference)
+        if (
+            self._pending_yaw_offset is not None
+            and self._pending_yaw_epoch == self.armed_source_epoch
+        ):
+            self.hold_yaw_offset = self._pending_yaw_offset
+        else:
+            self.hold_yaw_offset = self.active_yaw_offset
+
     def close_live_reference_gate(
         self,
         *,
@@ -1123,11 +1213,21 @@ class SonicTeleopPolicy(JointPolicy):
         rearm_required: bool,
         preserve_pending_yaw: bool = False,
     ) -> None:
+        if hold_last_reference:
+            self._capture_hold_if_needed()
         self.live_reference_gate_open = False
         self._gate_hold_requested = bool(hold_last_reference)
         self._gate_rearm_required = bool(rearm_required)
-        if not preserve_pending_yaw:
-            self.pending_yaw_offset = None
+        pending_matches_armed = bool(
+            self._pending_yaw_offset is not None
+            and self._pending_yaw_epoch == self.armed_source_epoch
+        )
+        keep_pending = pending_matches_armed and (
+            preserve_pending_yaw or not rearm_required
+        )
+        if not keep_pending:
+            self._pending_yaw_offset = None
+            self._pending_yaw_epoch = None
 
     def _active_reference(self) -> tuple[SmplReferenceFrame, str, float]:
         if self.source_kind == "legacy":
@@ -1148,7 +1248,7 @@ class SonicTeleopPolicy(JointPolicy):
         snapshot = self.poll_source_snapshot()
         now_mono = self._monotonic()
         now_ns = self._monotonic_ns()
-        valid = bool(
+        valid_live = bool(
             self.live_reference_gate_open
             and self.armed_source_epoch is not None
             and self.minimum_source_frame_index is not None
@@ -1160,7 +1260,7 @@ class SonicTeleopPolicy(JointPolicy):
                 now_ns=now_ns,
             )
         )
-        if valid:
+        if valid_live:
             assert snapshot.status is not None
             assert snapshot.reference is not None
             self._latest_authorized_reference = snapshot.reference
@@ -1180,6 +1280,8 @@ class SonicTeleopPolicy(JointPolicy):
                 rearm_required=changed_epoch,
                 preserve_pending_yaw=not changed_epoch,
             )
+        if self._gate_hold_requested and self._held_reference is not None:
+            return self._held_reference, "hold", now_mono
         return self._offline_frame(), "idle", now_mono
 
     def _begin_source_transition(self, source: str, now_mono: float) -> None:
@@ -1188,25 +1290,175 @@ class SonicTeleopPolicy(JointPolicy):
         self.source_transition_from = self.reference_source
         self.reference_source = source
         self.reset_yaw_alignment()
-        self.source_blend_from = self.target_dof_pos.copy()
-        self.source_blend_started_at = now_mono
-        self.source_blend_active = self.source_blend_duration_s > 0.0
+        self._source_blend_from = self.target_dof_pos.copy()
+        self._source_blend_started_at = now_mono
+        self._source_blend_kind = "source_change"
+        self._source_blend_active = self.source_blend_duration_s > 0.0
+
+    def _begin_xsens_blend(
+        self,
+        kind: SourceBlendKind,
+        now_mono: float,
+    ) -> None:
+        self._source_blend_from = self.target_dof_pos.copy()
+        self._source_blend_started_at = float(now_mono)
+        self._source_blend_kind = kind
+        self._source_blend_active = self.source_blend_duration_s > 0.0
+        if not self._source_blend_active:
+            self._complete_xsens_blend()
+
+    def _complete_xsens_blend(self) -> None:
+        completed_kind = self._source_blend_kind
+        if completed_kind in {"idle_to_live", "hold_to_rearm"}:
+            if (
+                self._pending_yaw_offset is not None
+                and self._pending_yaw_epoch == self.armed_source_epoch
+            ):
+                self.active_yaw_offset = self._pending_yaw_offset
+                self._pending_yaw_offset = None
+                self._pending_yaw_epoch = None
+        if completed_kind in {"hold_to_live", "hold_to_rearm"}:
+            self._held_reference = None
+            self._gate_hold_requested = False
+        self._source_blend_active = False
+        self._source_blend_kind = None
+        self.source_transition_from = None
+
+    def _yaw_offset_for(
+        self,
+        reference: SmplReferenceFrame,
+        robot_anchor: np.ndarray,
+    ) -> float:
+        if reference.anchor_quat is not None:
+            reference_yaw = _yaw_from_quat_wxyz(reference.anchor_quat[-1])
+            bias = 0.0
+        else:
+            reference_yaw = _yaw_from_quat_wxyz(reference.root_quat[-1])
+            bias = self.yaw_bias_rad
+        return (
+            reference_yaw
+            - _yaw_from_quat_wxyz(robot_anchor)
+            + bias
+        )
+
+    def _compute_selected_yaw_offset(self) -> float:
+        if self._selected_reference is None:
+            raise RuntimeError("no selected Xsens reference")
+        return self._yaw_offset_for(
+            self._selected_reference, self._last_robot_anchor
+        )
+
+    def _prepare_xsens_selection(
+        self,
+        reference: SmplReferenceFrame,
+        source: str,
+        robot_anchor: np.ndarray,
+        now_mono: float,
+    ) -> float:
+        previous = self.reference_source
+        if (
+            source == "live"
+            and self._gate_reset_yaw_requested
+        ):
+            self._pending_yaw_offset = self._yaw_offset_for(
+                reference, robot_anchor
+            )
+            self._pending_yaw_epoch = self.armed_source_epoch
+            self._gate_reset_yaw_requested = False
+
+        if source == "live":
+            selected_yaw = (
+                self._pending_yaw_offset
+                if self._pending_yaw_offset is not None
+                and self._pending_yaw_epoch == self.armed_source_epoch
+                else self.active_yaw_offset
+            )
+        elif source == "hold":
+            selected_yaw = self.hold_yaw_offset
+        else:
+            self._capture_yaw_if_needed(reference, robot_anchor)
+            selected_yaw = self.yaw_offset
+
+        if source != previous:
+            if source == "live" and previous in {None, "idle"}:
+                kind: SourceBlendKind = "idle_to_live"
+            elif source == "hold" and previous == "live":
+                kind = "live_to_hold"
+            elif source == "live" and previous == "hold":
+                kind = (
+                    "hold_to_rearm"
+                    if self._pending_yaw_offset is not None
+                    else "hold_to_live"
+                )
+            else:
+                kind = "source_change"
+            self.source_transition_from = previous
+            self.reference_source = source
+            self._begin_xsens_blend(kind, now_mono)
+
+        self._selected_reference = reference
+        self._selected_yaw_offset = float(selected_yaw)
+        return self._selected_yaw_offset
+
+    def reset_xsens_alignment(self, context: AlignmentContext) -> bool:
+        if (
+            self.source_kind != "xsens"
+            or self._source_blend_active
+            or self._pending_yaw_offset is not None
+            or self._selected_reference is None
+        ):
+            return False
+        valid_context = {
+            "fresh": (
+                self.reference_source == "live"
+                and self.live_reference_gate_open
+            ),
+            "same_epoch_hold": (
+                self.reference_source == "hold"
+                and not self._gate_rearm_required
+            ),
+            "rearm_hold": (
+                self.reference_source == "hold"
+                and self._gate_rearm_required
+            ),
+        }
+        if context not in valid_context or not valid_context[context]:
+            return False
+
+        replacement = self._compute_selected_yaw_offset()
+        if context == "fresh":
+            self.active_yaw_offset = replacement
+        elif context == "same_epoch_hold":
+            self.active_yaw_offset = replacement
+            self.hold_yaw_offset = replacement
+        else:
+            self.hold_yaw_offset = replacement
+        self._selected_yaw_offset = replacement
+        self._begin_xsens_blend("alignment", self._monotonic())
+        return True
 
     def _blend_source_target(
         self, candidate: np.ndarray, now_mono: float
     ) -> np.ndarray:
-        if not self.source_blend_active:
-            return candidate
-        progress = np.clip(
-            (now_mono - self.source_blend_started_at) / self.source_blend_duration_s,
+        if not self._source_blend_active:
+            return np.asarray(candidate, dtype=np.float32)
+        progress = float(np.clip(
+            (now_mono - self._source_blend_started_at)
+            / self.source_blend_duration_s,
             0.0,
             1.0,
+        ))
+        if now_mono >= (
+            self._source_blend_started_at + self.source_blend_duration_s
+        ):
+            progress = 1.0
+        alpha = progress * progress * (3.0 - 2.0 * progress)
+        blended = (
+            (1.0 - alpha) * self._source_blend_from
+            + alpha * candidate
         )
-        alpha = float(progress * progress * (3.0 - 2.0 * progress))
-        blended = (1.0 - alpha) * self.source_blend_from + alpha * candidate
         if progress >= 1.0:
-            self.source_blend_active = False
-            self.source_transition_from = None
+            self._complete_xsens_blend()
         return np.asarray(blended, dtype=np.float32)
 
     def _update_history(
@@ -1263,17 +1515,29 @@ class SonicTeleopPolicy(JointPolicy):
     def _build_model_input(
         self,
         frame: SmplReferenceFrame,
+        source: str,
+        now_mono: float,
         q: np.ndarray,
         dq: np.ndarray,
         quat_wxyz: np.ndarray,
         omega: np.ndarray,
     ) -> np.ndarray:
-        anchor = self._update_history(q, dq, quat_wxyz, omega)
-        self._capture_yaw_if_needed(frame, anchor)
-        anchor_aligned = _quat_mul_wxyz(
-            _axis_angle_quat_wxyz("z", self.yaw_offset), anchor
-        )
+        robot_anchor = self._update_history(q, dq, quat_wxyz, omega)
+        self._last_robot_anchor = robot_anchor.copy()
+        if self.source_kind == "xsens":
+            selected_yaw = self._prepare_xsens_selection(
+                frame, source, robot_anchor, now_mono
+            )
+        else:
+            self._capture_yaw_if_needed(frame, robot_anchor)
+            selected_yaw = self.yaw_offset
+            self._selected_reference = frame
+            self._selected_yaw_offset = selected_yaw
 
+        anchor_aligned = _quat_mul_wxyz(
+            _axis_angle_quat_wxyz("z", selected_yaw),
+            robot_anchor,
+        )
         model_input = np.zeros(MODEL_INPUT_DIM, dtype=np.float32)
         self._write_smpl_tokenizer(frame, anchor_aligned, model_input)
         proprio = np.concatenate(
@@ -1301,9 +1565,12 @@ class SonicTeleopPolicy(JointPolicy):
         omega = np.asarray(omega, dtype=np.float32).reshape(3)
 
         frame, source, now_mono = self._active_reference()
-        self._begin_source_transition(source, now_mono)
+        if self.source_kind == "legacy":
+            self._begin_source_transition(source, now_mono)
 
-        model_input = self._build_model_input(frame, q, dq, quat_wxyz, omega)
+        model_input = self._build_model_input(
+            frame, source, now_mono, q, dq, quat_wxyz, omega
+        )
         np.copyto(self.input_buffer, model_input)
         raw_action = np.asarray(self._backend.run(self._inputs)["action"]).reshape(-1)
         if raw_action.size != NUM_JOINTS:

@@ -80,7 +80,7 @@ class DeterministicBackend:
         human = float(np.mean(observation[0, :720]))
         root = float(observation[0, SMPL_ROOT_ORI_START + 1])
         proprio = float(np.mean(observation[0, SMPL_TOKENIZER_DIM:]))
-        signal = human + 0.25 * root + 0.01 * proprio
+        signal = 0.01 * human + 0.25 * root + 0.01 * proprio
         return {
             "action": np.full(
                 (1, 29), np.tanh(signal) * np.float32(0.1), dtype=np.float32
@@ -364,6 +364,119 @@ def enter_hold(
     )
     policy.step(make_inference_frame(), 0.02)
     return live
+
+
+def enter_completed_live(
+    harness: PolicyHarness,
+    *,
+    epoch: int = 71,
+    root_yaw: float = 0.1,
+) -> SmplReferenceFrame:
+    reference = make_reference(
+        epoch=epoch, newest_frame=110, row_marker=np.arange(10),
+        root_yaw_rad=root_yaw,
+        producer_monotonic_ns=harness.clock.now_ns,
+    )
+    authorize_reference(harness.policy, reference)
+    harness.step()
+    harness.finish_blend()
+    assert not harness.policy.source_blend_active
+    return reference
+
+
+def inject_healthy_pair(
+    policy: TestableSonicPolicy,
+    reference: SmplReferenceFrame,
+    *,
+    sequence: int,
+    recovery_frames: int = 10,
+) -> None:
+    assert reference.source_epoch is not None
+    assert reference.source_newest_frame_index is not None
+    assert reference.producer_monotonic_ns is not None
+    policy.inject_status(make_status(
+        status_sequence=sequence,
+        status_monotonic_ns=policy.test_clock.now_ns,
+        source_epoch=reference.source_epoch,
+        accepted_arm_epoch=reference.source_epoch,
+        producer_monotonic_ns=reference.producer_monotonic_ns,
+        newest_frame_index=reference.source_newest_frame_index,
+        ready=True, reference_window_ready=True, source_stale=False,
+        ready_frames=30, recovery_frames=recovery_frames,
+        reason_code=(
+            XsensReason.ARMED_FRESH
+            if recovery_frames >= 10
+            else XsensReason.ARMED_RECOVERING
+        ),
+    ))
+    policy.inject_reference(reference)
+    policy.poll_source_snapshot()
+
+
+def inject_same_epoch_recovery(
+    policy: TestableSonicPolicy,
+    *,
+    newest: int = 120,
+) -> SmplReferenceFrame:
+    assert policy.armed_source_epoch is not None
+    reference = make_reference(
+        epoch=policy.armed_source_epoch, newest_frame=newest,
+        row_marker=np.arange(10) + 20,
+        producer_monotonic_ns=policy.test_clock.now_ns,
+    )
+    inject_healthy_pair(policy, reference, sequence=14)
+    assert policy.open_live_reference_gate(
+        source_epoch=reference.source_epoch,
+        minimum_source_frame_index=newest,
+        reset_yaw=False, arm_proof=None,
+    )
+    return reference
+
+
+def enter_rearm_blend(
+    harness: PolicyHarness,
+    *,
+    old_epoch: int = 71,
+    new_epoch: int = 72,
+) -> tuple[SmplReferenceFrame, float]:
+    enter_completed_live(harness, epoch=old_epoch, root_yaw=0.1)
+    old_yaw = harness.policy.active_yaw_offset
+    harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=True
+    )
+    harness.step()
+    harness.finish_blend()
+    reference = make_reference(
+        epoch=new_epoch, newest_frame=210, row_marker=np.arange(10) + 40,
+        root_yaw_rad=1.0, producer_monotonic_ns=harness.clock.now_ns,
+    )
+    proof = inject_exact_authorized_pair(
+        harness.policy,
+        epoch=new_epoch, command_id=8, sequence=20, newest=210,
+        reference=reference,
+    )
+    assert harness.policy.open_live_reference_gate(
+        source_epoch=new_epoch, minimum_source_frame_index=210,
+        reset_yaw=True, arm_proof=proof,
+    )
+    harness.step()
+    return reference, old_yaw
+
+
+def settle_hold(
+    harness: PolicyHarness,
+    *,
+    rearm_required: bool,
+) -> SmplReferenceFrame:
+    reference = enter_completed_live(harness)
+    harness.policy.close_live_reference_gate(
+        hold_last_reference=True,
+        rearm_required=rearm_required,
+    )
+    harness.step()
+    harness.finish_blend()
+    assert not harness.policy.source_blend_active
+    return reference
 
 
 def test_cached_ack_and_reference_cannot_open_gate(policy, fake_clock):
@@ -1128,3 +1241,403 @@ def test_gate_is_revalidated_before_every_xsens_inference(
     policy_harness.step()
     assert not policy_harness.policy.live_reference_gate_open
     assert policy_harness.policy.reference_source in {"idle", "hold"}
+
+
+def test_fresh_to_hold_tiles_newest_human_row(policy):
+    live = make_reference(epoch=71, newest_frame=109, row_marker=np.arange(10))
+    authorize_reference(policy, live)
+    policy.close_live_reference_gate(
+        hold_last_reference=True,
+        rearm_required=False,
+    )
+    held = policy.held_reference
+    np.testing.assert_array_equal(
+        held.term1_local,
+        np.repeat(live.term1_local[-1:], 10, axis=0),
+    )
+    np.testing.assert_array_equal(
+        held.root_quat,
+        np.repeat(live.root_quat[-1:], 10, axis=0),
+    )
+
+
+def test_hold_inference_uses_current_robot_proprioception(policy):
+    enter_hold(policy)
+    policy.step(make_inference_frame(qpos_offset=0.0), 0.02)
+    first = policy.input_buffer.copy()
+    policy.step(make_inference_frame(qpos_offset=0.1), 0.02)
+    second = policy.input_buffer.copy()
+    assert not np.array_equal(first, second)
+    np.testing.assert_array_equal(
+        policy.selected_reference.term1_local,
+        policy.held_reference.term1_local,
+    )
+
+
+def test_reset_robot_target_seed_is_opt_in_and_runtime_config_survives(policy):
+    measured = make_inference_frame(qpos_offset=0.25)
+    policy.reset(measured, seed_target_from_robot=True)
+    np.testing.assert_array_equal(
+        policy.target_dof_pos, measured.joints.position
+    )
+    assert policy.source_kind == "xsens"
+    assert policy.status_timeout_s == pytest.approx(0.2)
+    assert policy.live_ref_timeout_s == pytest.approx(0.5)
+
+    policy.reset(measured)
+    np.testing.assert_array_equal(
+        policy.target_dof_pos, policy.default_dof_pos
+    )
+
+
+@pytest.mark.parametrize("with_anchor", [False, True])
+def test_hold_tiles_wrist_and_optional_anchor(policy, with_anchor):
+    reference = make_reference(row_marker=np.arange(10), with_anchor=with_anchor)
+    authorize_reference(policy, reference)
+    policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=False
+    )
+    policy.step(make_inference_frame(), 0.02)
+    held = policy.held_reference
+    np.testing.assert_array_equal(
+        held.term1_local,
+        np.repeat(reference.term1_local[-1:], 10, axis=0),
+    )
+    np.testing.assert_array_equal(
+        held.root_quat,
+        np.repeat(reference.root_quat[-1:], 10, axis=0),
+    )
+    np.testing.assert_array_equal(
+        held.wrist, np.repeat(reference.wrist[-1:], 10, axis=0)
+    )
+    assert (held.anchor_quat is None) is (not with_anchor)
+    if with_anchor:
+        np.testing.assert_array_equal(
+            held.anchor_quat,
+            np.repeat(reference.anchor_quat[-1:], 10, axis=0),
+        )
+
+
+def test_fresh_to_hold_starts_exactly_one_blend(policy_harness):
+    enter_completed_live(policy_harness)
+    policy_harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=False
+    )
+    policy_harness.step()
+    started = policy_harness.policy.source_blend_started_at
+    origin = policy_harness.policy.source_blend_from
+    policy_harness.step()
+    assert policy_harness.policy.source_blend_active
+    assert policy_harness.policy.source_blend_started_at == started
+    np.testing.assert_array_equal(
+        policy_harness.policy.source_blend_from, origin
+    )
+
+
+def test_repeated_reference_does_not_restart_blend(policy_harness):
+    reference = make_reference(
+        row_marker=np.arange(10),
+        producer_monotonic_ns=policy_harness.clock.now_ns,
+    )
+    authorize_reference(policy_harness.policy, reference)
+    policy_harness.step()
+    assert policy_harness.policy.source_blend_active
+    started = policy_harness.policy.source_blend_started_at
+    origin = policy_harness.policy.source_blend_from
+    policy_harness.policy.inject_reference(reference)
+    policy_harness.policy.poll_source_snapshot()
+    policy_harness.step()
+    assert policy_harness.policy.source_blend_started_at == started
+    np.testing.assert_array_equal(
+        policy_harness.policy.source_blend_from, origin
+    )
+
+
+def test_ninth_recovery_frame_remains_hold_until_join(policy_harness):
+    settle_hold(policy_harness, rearm_required=False)
+    policy = policy_harness.policy
+    recovery = make_reference(
+        epoch=policy.armed_source_epoch,
+        newest_frame=120,
+        row_marker=np.arange(10) + 20,
+        producer_monotonic_ns=policy_harness.clock.now_ns,
+    )
+    inject_healthy_pair(
+        policy, recovery, sequence=20, recovery_frames=9
+    )
+    policy_harness.step()
+    assert not policy.live_reference_gate_open
+    np.testing.assert_array_equal(
+        policy.selected_reference.term1_local,
+        policy.held_reference.term1_local,
+    )
+
+    inject_healthy_pair(
+        policy, recovery, sequence=21, recovery_frames=10
+    )
+    policy_harness.step()
+    assert not policy.live_reference_gate_open
+    assert policy.reference_source == "hold"
+    assert policy.open_live_reference_gate(
+        source_epoch=71,
+        minimum_source_frame_index=120,
+        reset_yaw=False,
+        arm_proof=None,
+    )
+    policy_harness.step()
+    assert policy.reference_source == "live"
+
+
+def test_same_epoch_recovery_preserves_active_yaw(policy_harness):
+    enter_completed_live(policy_harness, root_yaw=0.2)
+    policy = policy_harness.policy
+    yaw = policy.active_yaw_offset
+    policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=False
+    )
+    policy_harness.step()
+    inject_same_epoch_recovery(policy)
+    policy_harness.step()
+    policy_harness.finish_blend()
+    assert policy.active_yaw_offset == pytest.approx(yaw)
+
+
+def test_new_epoch_rearm_uses_independent_pending_yaw(policy_harness):
+    _, old = enter_rearm_blend(
+        policy_harness, old_epoch=71, new_epoch=72
+    )
+    pending = policy_harness.policy.pending_yaw_offset
+    assert pending is not None
+    assert pending != pytest.approx(old)
+    assert policy_harness.policy.active_yaw_offset == pytest.approx(old)
+    policy_harness.finish_blend()
+    assert policy_harness.policy.active_yaw_offset == pytest.approx(pending)
+    assert policy_harness.policy.pending_yaw_offset is None
+
+
+def test_stale_during_initial_arm_blend_preempts_from_current_target(
+    policy_harness,
+):
+    reference = make_reference(
+        row_marker=np.arange(10),
+        producer_monotonic_ns=policy_harness.clock.now_ns,
+    )
+    authorize_reference(policy_harness.policy, reference)
+    policy_harness.step()
+    original = policy_harness.policy.source_blend_from
+    pending = policy_harness.policy.pending_yaw_offset
+    assert pending is not None
+    sampled = policy_harness.advance_and_step(200_000_000)
+    policy_harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=False
+    )
+    policy_harness.step()
+    np.testing.assert_array_equal(
+        policy_harness.policy.source_blend_from, sampled
+    )
+    assert not np.array_equal(
+        policy_harness.policy.source_blend_from, original
+    )
+    assert policy_harness.policy.pending_yaw_offset == pytest.approx(pending)
+    assert policy_harness.policy.hold_yaw_offset == pytest.approx(pending)
+
+
+def test_epoch_change_during_initial_arm_blend_keeps_latest_human_hold(
+    policy_harness,
+):
+    reference = make_reference(
+        row_marker=np.arange(10),
+        producer_monotonic_ns=policy_harness.clock.now_ns,
+    )
+    authorize_reference(policy_harness.policy, reference)
+    policy_harness.step()
+    original = policy_harness.policy.source_blend_from
+    pending = policy_harness.policy.pending_yaw_offset
+    assert pending is not None
+    sampled = policy_harness.advance_and_step(200_000_000)
+    policy_harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=True
+    )
+    policy_harness.step()
+    np.testing.assert_array_equal(
+        policy_harness.policy.source_blend_from, sampled
+    )
+    assert not np.array_equal(
+        policy_harness.policy.source_blend_from, original
+    )
+    assert policy_harness.policy.pending_yaw_offset is None
+    assert policy_harness.policy.hold_yaw_offset == pytest.approx(pending)
+    np.testing.assert_array_equal(
+        policy_harness.policy.held_reference.term1_local,
+        np.repeat(reference.term1_local[-1:], 10, axis=0),
+    )
+
+
+def test_stale_during_rearm_blend_preempts_from_current_target(
+    policy_harness,
+):
+    enter_rearm_blend(policy_harness)
+    original = policy_harness.policy.source_blend_from
+    sampled = policy_harness.advance_and_step(200_000_000)
+    pending = policy_harness.policy.pending_yaw_offset
+    assert pending is not None
+    policy_harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=False,
+        preserve_pending_yaw=True,
+    )
+    policy_harness.step()
+    np.testing.assert_array_equal(
+        policy_harness.policy.source_blend_from, sampled
+    )
+    assert not np.array_equal(
+        policy_harness.policy.source_blend_from, original
+    )
+    assert policy_harness.policy.pending_yaw_offset == pytest.approx(pending)
+    assert policy_harness.policy._selected_yaw_offset == pytest.approx(
+        policy_harness.policy.hold_yaw_offset
+    )
+
+
+def test_old_hold_clears_only_after_successful_blend(policy_harness):
+    settle_hold(policy_harness, rearm_required=False)
+    recovery = inject_same_epoch_recovery(policy_harness.policy)
+    policy_harness.step()
+    policy_harness.clock.advance_ns(399_999_999)
+    inject_healthy_pair(
+        policy_harness.policy, recovery, sequence=30
+    )
+    policy_harness.step()
+    assert policy_harness.policy.held_reference is not None
+
+    policy_harness.clock.advance_ns(1)
+    inject_healthy_pair(
+        policy_harness.policy, recovery, sequence=31
+    )
+    policy_harness.step()
+    assert policy_harness.policy.held_reference is None
+
+
+def test_pending_yaw_survives_only_same_armed_epoch(policy_harness):
+    enter_rearm_blend(policy_harness)
+    pending = policy_harness.policy.pending_yaw_offset
+    policy_harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=False,
+        preserve_pending_yaw=True,
+    )
+    policy_harness.step()
+    assert policy_harness.policy.pending_yaw_offset == pytest.approx(pending)
+    policy_harness.policy.close_live_reference_gate(
+        hold_last_reference=True, rearm_required=True,
+        preserve_pending_yaw=False,
+    )
+    assert policy_harness.policy.pending_yaw_offset is None
+
+
+@pytest.mark.parametrize(
+    "context",
+    ["fresh", "same_epoch_hold", "rearm_hold"],
+)
+def test_manual_alignment_updates_only_phase_owned_yaw_context(
+    policy_harness, monkeypatch, context,
+):
+    if context == "fresh":
+        enter_completed_live(policy_harness)
+    elif context == "same_epoch_hold":
+        settle_hold(policy_harness, rearm_required=False)
+    else:
+        settle_hold(policy_harness, rearm_required=True)
+
+    policy = policy_harness.policy
+    before_target = policy.target_dof_pos.copy()
+    before_active = policy.active_yaw_offset
+    before_hold = policy.hold_yaw_offset
+    held = policy.held_reference
+    monkeypatch.setattr(policy, "_compute_selected_yaw_offset", lambda: 3.0)
+    assert policy.reset_xsens_alignment(context)
+    if context == "fresh":
+        assert policy.active_yaw_offset == pytest.approx(3.0)
+        assert policy.hold_yaw_offset == pytest.approx(before_hold)
+    elif context == "same_epoch_hold":
+        assert policy.active_yaw_offset == pytest.approx(3.0)
+        assert policy.hold_yaw_offset == pytest.approx(3.0)
+    else:
+        assert policy.active_yaw_offset == pytest.approx(before_active)
+        assert policy.hold_yaw_offset == pytest.approx(3.0)
+    assert policy.held_reference is held
+    assert policy.source_blend_active
+    np.testing.assert_array_equal(policy.source_blend_from, before_target)
+
+
+def test_stale_during_alignment_blend_preempts_from_current_target(
+    policy_harness, monkeypatch,
+):
+    enter_completed_live(policy_harness)
+    policy = policy_harness.policy
+    policy_harness.clock.advance_ns(1)
+    fresh = make_reference(
+        epoch=policy.armed_source_epoch,
+        newest_frame=120,
+        row_marker=np.arange(10),
+        root_yaw_rad=0.1,
+        producer_monotonic_ns=policy_harness.clock.now_ns,
+    )
+    inject_healthy_pair(policy, fresh, sequence=13)
+    policy_harness.step()
+    monkeypatch.setattr(
+        policy,
+        "_compute_selected_yaw_offset",
+        lambda: policy.active_yaw_offset + 0.5,
+    )
+    assert policy.reset_xsens_alignment("fresh")
+    original = policy.source_blend_from
+    policy_harness.step()
+    sampled = policy_harness.advance_and_step(200_000_000)
+    policy.close_live_reference_gate(
+        hold_last_reference=True,
+        rearm_required=False,
+    )
+    policy_harness.step()
+    np.testing.assert_array_equal(policy.source_blend_from, sampled)
+    assert not np.array_equal(policy.source_blend_from, original)
+
+
+@pytest.mark.parametrize("blocked_by", ["active_blend", "pending_yaw"])
+def test_manual_alignment_rejects_active_blend_or_retained_pending_yaw(
+    policy_harness, blocked_by,
+):
+    if blocked_by == "active_blend":
+        reference = make_reference(
+            producer_monotonic_ns=policy_harness.clock.now_ns
+        )
+        authorize_reference(policy_harness.policy, reference)
+        policy_harness.step()
+        context = "fresh"
+    else:
+        enter_rearm_blend(policy_harness)
+        policy_harness.policy.close_live_reference_gate(
+            hold_last_reference=True,
+            rearm_required=False,
+            preserve_pending_yaw=True,
+        )
+        policy_harness.step()
+        policy_harness.finish_blend()
+        assert not policy_harness.policy.source_blend_active
+        assert policy_harness.policy.pending_yaw_offset is not None
+        context = "same_epoch_hold"
+
+    policy = policy_harness.policy
+    before = (
+        policy.active_yaw_offset,
+        policy.hold_yaw_offset,
+        policy.pending_yaw_offset,
+        policy.source_blend_started_at,
+    )
+    held = policy.held_reference
+    assert not policy.reset_xsens_alignment(context)
+    assert (
+        policy.active_yaw_offset,
+        policy.hold_yaw_offset,
+        policy.pending_yaw_offset,
+        policy.source_blend_started_at,
+    ) == before
+    assert policy.held_reference is held
