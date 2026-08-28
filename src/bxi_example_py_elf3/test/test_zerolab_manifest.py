@@ -108,6 +108,7 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         assert set(definition.state_factories) == {
             "sonic_teleop",
             "sonic_zerolab",
+            "sonic_xsens",
         }
 
         pico_context = StateBuildContext("com.bxi.sonic/sonic_teleop", 1, {})
@@ -155,3 +156,202 @@ def test_process_loader_imports_zerolab_source_with_dynamic_package():
         assert spec.params["pose_port"] == 5558
     finally:
         _remove_module_prefixes((module_prefix,))
+
+
+LEGACY_MANIFEST_SNAPSHOT = yaml.safe_load(
+    r"""
+nodes:
+  pico_manager:
+    runtime: command
+    entrypoint: pico/manager_launcher.py
+    interpreter: python3
+    runtime_profile: pico_bootstrap
+    execution: process
+    lifecycle: state
+    states: [sonic_teleop]
+    arguments: [--manager, --num_frames_to_send, "10", --target_fps, "50"]
+    environment: {PYTHONUNBUFFERED: "1"}
+    manifest: {label: SONIC PICO管理器}
+    runtime_requirements: {python: [], ros: [], system: []}
+    restart:
+      max_attempts: 3
+      delay: 3.0
+      non_retryable_exit_codes: [78]
+    shutdown: {signal: SIGINT, terminate_after: 3.0, kill_after: 5.0}
+  smpl_bridge:
+    runtime: python
+    entrypoint: pico.pose_to_smpl_ref_bridge:create_node
+    execution: in_process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_teleop]
+    depends_on: [pico_manager]
+    params:
+      pico_host: 127.0.0.1
+      pico_port: 5556
+      pico_topic: pose
+      out_host: 127.0.0.1
+      out_port: 5557
+      out_topic: smpl_ref
+      rate_hz: 50.0
+      history_frames: 5
+      max_gap_frames: 200
+      catch_up_enabled: true
+      stale_warning_seconds: 0.5
+    manifest: {label: SONIC SMPL参考桥}
+    runtime_requirements:
+      python: [{import: zmq}]
+      ros: [{package: rclpy}, {package: std_msgs}]
+      system: []
+  zerolab_source:
+    runtime: python
+    entrypoint: zerolab.source_node:create_node
+    execution: process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_zerolab]
+    params:
+      udp_bind_host: 0.0.0.0
+      udp_port: 18000
+      allowed_sender: ""
+      pose_host: 127.0.0.1
+      pose_port: 5558
+      pose_topic: pose
+      rate_hz: 50.0
+      window_frames: 10
+      stale_seconds: 0.5
+      record_path: ""
+    manifest: {label: ZeroLab姿态源}
+    runtime_requirements:
+      python: [{import: numpy}, {import: scipy}, {import: zmq}]
+      ros: [{package: rclpy}]
+      system: []
+    shutdown: {signal: SIGINT, terminate_after: 3.0, kill_after: 5.0}
+  zerolab_bridge:
+    runtime: python
+    entrypoint: pico.pose_to_smpl_ref_bridge:create_node
+    execution: in_process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_zerolab]
+    depends_on: [zerolab_source]
+    params:
+      pico_host: 127.0.0.1
+      pico_port: 5558
+      pico_topic: pose
+      out_host: 127.0.0.1
+      out_port: 5557
+      out_topic: smpl_ref
+      rate_hz: 50.0
+      history_frames: 5
+      max_gap_frames: 200
+      catch_up_enabled: true
+      stale_warning_seconds: 0.5
+    manifest: {label: ZeroLab SMPL参考桥}
+    runtime_requirements:
+      python: [{import: zmq}]
+      ros: [{package: rclpy}, {package: std_msgs}]
+      system: []
+events:
+  activate: {slot: btn_10, value: 9}
+  reset_alignment: {slot: btn_9, value: 1}
+  activate_zerolab: {slot: btn_10, value: 4}
+states:
+  sonic_teleop:
+    manifest:
+      label: SONIC遥操
+      priority: 840
+      group: Advanced
+      icon: sports_esports
+      confirm: true
+      confirm_message: 使用前务必查看官方WIKI，进入后先保持idle站立；若启用夹爪，请先松开左右trigger并确认周围安全
+    params:
+      require_live_reference: false
+      yaw_bias_rad: 1.57079632679
+      live_reference_timeout_s: 0.5
+      idle_frame_start: 3509
+      source_blend_seconds: 0.4
+      hardware_gripper: false
+      gripper_input_timeout_s: 0.2
+      gripper_release_threshold: 0.05
+      gripper_left_bus: 5
+      gripper_right_bus: 6
+      gripper_can_id: 1
+      gripper_kp: 20.0
+      gripper_kd: 1.0
+  sonic_zerolab:
+    manifest:
+      label: SONIC ZeroLab遥操
+      priority: 839
+      group: Advanced
+      icon: sports_esports
+      confirm: true
+      confirm_message: 请保持T-pose两秒，等待ZeroLab校准完成后再开始动作
+    params:
+      operator_prompt: 请保持T-pose两秒，等待ZeroLab校准完成后再开始动作
+      require_live_reference: false
+      yaw_bias_rad: 1.57079632679
+      live_reference_timeout_s: 0.5
+      idle_frame_start: 3509
+      source_blend_seconds: 0.4
+      hardware_gripper: false
+      gripper_input_timeout_s: 0.2
+      gripper_release_threshold: 0.05
+      gripper_left_bus: 5
+      gripper_right_bus: 6
+      gripper_can_id: 1
+      gripper_kp: 20.0
+      gripper_kd: 1.0
+routes:
+  - {from: com.bxi.basic_actions/normal, event: activate, to: sonic_teleop, transition: soft_switch}
+  - {from: sonic_teleop, event: com.bxi.basic_actions/normal, to: com.bxi.basic_actions/normal, transition: soft_switch}
+  - {from: sonic_teleop, event: com.bxi.basic_actions/zero_torque, to: com.bxi.basic_actions/zero_torque}
+  - {from: sonic_teleop, event: com.bxi.basic_actions/pd_brake, to: com.bxi.basic_actions/pd_brake}
+  - {from: sonic_teleop, event: com.bxi.basic_actions/recover, to: com.bxi.basic_actions/recover, transition: soft_switch}
+  - {from: com.bxi.basic_actions/normal, event: activate_zerolab, to: sonic_zerolab, transition: soft_switch}
+  - {from: sonic_zerolab, event: com.bxi.basic_actions/normal, to: com.bxi.basic_actions/normal, transition: soft_switch}
+  - {from: sonic_zerolab, event: com.bxi.basic_actions/zero_torque, to: com.bxi.basic_actions/zero_torque}
+  - {from: sonic_zerolab, event: com.bxi.basic_actions/pd_brake, to: com.bxi.basic_actions/pd_brake}
+  - {from: sonic_zerolab, event: com.bxi.basic_actions/recover, to: com.bxi.basic_actions/recover, transition: soft_switch}
+actions:
+  - from: sonic_teleop
+    event: reset_alignment
+    action: reset_alignment
+    manifest: {label: 重置朝向对齐, ui: refresh}
+  - from: sonic_zerolab
+    event: reset_alignment
+    action: reset_alignment
+    manifest: {label: 重置朝向对齐, ui: refresh}
+"""
+)
+
+
+def test_existing_pico_and_zerolab_manifest_sections_are_unchanged():
+    manifest = load_manifest()
+    actual = {
+        "nodes": {
+            name: manifest["nodes"][name]
+            for name in (
+                "pico_manager", "smpl_bridge", "zerolab_source", "zerolab_bridge",
+            )
+        },
+        "events": {
+            name: manifest["events"][name]
+            for name in ("activate", "reset_alignment", "activate_zerolab")
+        },
+        "states": {
+            name: manifest["states"][name]
+            for name in ("sonic_teleop", "sonic_zerolab")
+        },
+        "routes": [
+            route for route in manifest["routes"]
+            if route["from"] != "sonic_xsens"
+            and route["to"] != "sonic_xsens"
+            and route["event"] != "activate_xsens"
+        ],
+        "actions": [
+            action for action in manifest["actions"]
+            if action["from"] != "sonic_xsens"
+        ],
+    }
+    assert actual == LEGACY_MANIFEST_SNAPSHOT

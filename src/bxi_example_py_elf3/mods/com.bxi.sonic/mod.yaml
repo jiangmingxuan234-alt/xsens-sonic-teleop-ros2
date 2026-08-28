@@ -157,6 +157,87 @@ nodes:
         - package: std_msgs
       system: []
 
+  xsens_source:
+    runtime: python
+    entrypoint: xsens.source_node:create_node
+    execution: process
+    runtime_profile: host_ros
+    lifecycle: state
+    states:
+      - sonic_xsens
+    params:
+      udp_bind_host: 0.0.0.0
+      udp_port: 9763
+      allowed_sender: 127.0.0.1
+      pose_host: 127.0.0.1
+      pose_port: 5559
+      pose_topic: pose
+      status_topic: xsens_status
+      arm_command_topic: sonic/xsens_arm_command
+      status_rate_hz: 50.0
+      input_rate_hz: 60.0
+      publish_rate_hz: 50.0
+      window_frames: 10
+      same_epoch_resume_frames: 10
+      ready_frames: 30
+      stale_seconds: 0.5
+      epoch_candidate_frames: 2
+      epoch_candidate_timeout_s: 0.25
+      max_pelvis_span_m: 0.15
+      max_segment_deviation_deg: 20.0
+    manifest:
+      label: Xsens MVN姿态源
+    runtime_requirements:
+      python:
+        - import: numpy
+        - import: scipy
+        - import: zmq
+      ros:
+        - package: rclpy
+        - package: std_msgs
+      system: []
+    shutdown:
+      signal: SIGINT
+      terminate_after: 3.0
+      kill_after: 5.0
+
+  xsens_bridge:
+    runtime: python
+    entrypoint: pico.pose_to_smpl_ref_bridge:create_node
+    execution: in_process
+    runtime_profile: host_ros
+    lifecycle: state
+    states:
+      - sonic_xsens
+    depends_on:
+      - xsens_source
+    params:
+      pico_host: 127.0.0.1
+      pico_port: 5559
+      input_pose_topic: pose
+      input_status_topic: xsens_status
+      out_host: 127.0.0.1
+      out_port: 5557
+      output_reference_topic: smpl_ref
+      output_status_topic: xsens_status
+      source_kind: xsens
+      authoritative_input_window: true
+      readiness_debounce_messages: 1
+      rate_hz: 50.0
+      history_frames: 5
+      max_gap_frames: 200
+      catch_up_enabled: true
+      stale_warning_seconds: 0.5
+    manifest:
+      label: Xsens SMPL参考桥
+    runtime_requirements:
+      python:
+        - import: zmq
+      ros:
+        - package: rclpy
+        - package: std_msgs
+      system: []
+
 events:
   activate:
     slot: btn_10
@@ -167,6 +248,9 @@ events:
   activate_zerolab:
     slot: btn_10
     value: 4
+  activate_xsens:
+    slot: btn_10
+    value: 11
 
 states:
   sonic_teleop:
@@ -216,6 +300,33 @@ states:
       gripper_kp: 20.0
       gripper_kd: 1.0
 
+  sonic_xsens:
+    manifest:
+      label: SONIC Xsens遥操
+      priority: 838
+      group: Advanced
+      icon: sports_esports
+      confirm: true
+      confirm_message: 请先保持近似中立姿势并等待READY；实时控制前确认机器人和人员周围安全
+    params:
+      operator_prompt: 保持近似中立姿势，等待 Xsens READY
+      require_live_reference: false
+      manual_live_enable: true
+      manual_enable_slot: btn_10
+      manual_enable_neutral_value: 0
+      seed_entry_from_robot: true
+      hold_last_live_reference: true
+      auto_resume_same_epoch: true
+      rearm_on_source_epoch_change: true
+      hardware_gripper: false
+      yaw_bias_rad: 1.57079632679
+      live_reference_timeout_s: 0.5
+      idle_frame_start: 3509
+      source_blend_seconds: 0.4
+      status_timeout_s: 0.2
+      arm_ack_timeout_s: 0.5
+      arm_command_topic: sonic/xsens_arm_command
+
 routes:
   - from: com.bxi.basic_actions/normal
     event: activate
@@ -253,6 +364,24 @@ routes:
     event: com.bxi.basic_actions/recover
     to: com.bxi.basic_actions/recover
     transition: soft_switch
+  - from: com.bxi.basic_actions/normal
+    event: activate_xsens
+    to: sonic_xsens
+    transition: soft_switch
+  - from: sonic_xsens
+    event: com.bxi.basic_actions/normal
+    to: com.bxi.basic_actions/normal
+    transition: soft_switch
+  - from: sonic_xsens
+    event: com.bxi.basic_actions/zero_torque
+    to: com.bxi.basic_actions/zero_torque
+  - from: sonic_xsens
+    event: com.bxi.basic_actions/pd_brake
+    to: com.bxi.basic_actions/pd_brake
+  - from: sonic_xsens
+    event: com.bxi.basic_actions/recover
+    to: com.bxi.basic_actions/recover
+    transition: soft_switch
 
 actions:
   - from: sonic_teleop
@@ -262,6 +391,18 @@ actions:
       label: 重置朝向对齐
       ui: refresh
   - from: sonic_zerolab
+    event: reset_alignment
+    action: reset_alignment
+    manifest:
+      label: 重置朝向对齐
+      ui: refresh
+  - from: sonic_xsens
+    event: activate_xsens
+    action: activate_xsens
+    manifest:
+      label: 请求Xsens实时控制
+      ui: play_arrow
+  - from: sonic_xsens
     event: reset_alignment
     action: reset_alignment
     manifest:

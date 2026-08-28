@@ -24,6 +24,8 @@ from zerolab.source_node import (
     validate_source_params,
 )
 from zerolab.udp_receiver import ReceivedDatagram
+from xsens.source_node import SOURCE_DEFAULTS, XsensSourceNode
+from xsens_test_helpers import reserve_tcp_port, reserve_udp_port
 
 
 MOD_ROOT = Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
@@ -162,6 +164,76 @@ def test_existing_bridge_releases_its_output_port(rclpy_runtime):
         NodeBuildContext("com.bxi.sonic", "bridge_b", "bridge_b", root, params)
     )
     second.destroy_node()
+
+
+def xsens_lifecycle_source_context(udp_port, pose_port, node_name):
+    params = dict(SOURCE_DEFAULTS)
+    params.update({
+        "udp_bind_host": "127.0.0.1",
+        "udp_port": udp_port,
+        "allowed_sender": "127.0.0.1",
+        "pose_host": "127.0.0.1",
+        "pose_port": pose_port,
+    })
+    return NodeBuildContext(
+        "com.bxi.sonic", f"com.bxi.sonic/{node_name}", node_name, MOD_ROOT, params
+    )
+
+
+def xsens_lifecycle_bridge_context(input_port, output_port, node_name):
+    return NodeBuildContext(
+        "com.bxi.sonic", f"com.bxi.sonic/{node_name}", node_name, MOD_ROOT,
+        {
+            "pico_host": "127.0.0.1", "pico_port": input_port,
+            "input_pose_topic": "pose", "input_status_topic": "xsens_status",
+            "out_host": "127.0.0.1", "out_port": output_port,
+            "output_reference_topic": "smpl_ref", "output_status_topic": "xsens_status",
+            "source_kind": "xsens", "authoritative_input_window": True,
+            "readiness_debounce_messages": 1, "rate_hz": 50.0,
+            "history_frames": 5, "max_gap_frames": 200,
+            "catch_up_enabled": True, "stale_warning_seconds": 0.5,
+        },
+    )
+
+
+def test_repeated_xsens_lifecycle_releases_reserved_udp_and_zmq_ports(
+    rclpy_runtime,
+):
+    udp_port = reserve_udp_port()
+    pose_port = reserve_tcp_port()
+    output_port = reserve_tcp_port()
+    while output_port == pose_port:
+        output_port = reserve_tcp_port()
+
+    for suffix in ("a", "b"):
+        source = XsensSourceNode(
+            xsens_lifecycle_source_context(udp_port, pose_port, f"xsens_source_{suffix}")
+        )
+        bridge = None
+        try:
+            bridge = SmplRefBridgeNode(
+                xsens_lifecycle_bridge_context(pose_port, output_port, f"xsens_bridge_{suffix}")
+            )
+        finally:
+            if bridge is not None:
+                bridge.destroy_node()
+            source.destroy_node()
+
+    udp_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    zmq_context = zmq.Context()
+    pose_probe = zmq_context.socket(zmq.PUB)
+    output_probe = zmq_context.socket(zmq.PUB)
+    for probe in (pose_probe, output_probe):
+        probe.setsockopt(zmq.LINGER, 0)
+    try:
+        udp_probe.bind(("127.0.0.1", udp_port))
+        pose_probe.bind(f"tcp://127.0.0.1:{pose_port}")
+        output_probe.bind(f"tcp://127.0.0.1:{output_port}")
+    finally:
+        udp_probe.close()
+        pose_probe.close(linger=0)
+        output_probe.close(linger=0)
+        zmq_context.term()
 
 
 class ControlledReceiver:

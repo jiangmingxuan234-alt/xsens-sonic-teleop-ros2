@@ -44,6 +44,8 @@ RKNN -> OpenVINO -> ONNX Runtime
 UDP 18000，不能同时运行。Windows/Ubuntu 配置、五项现场录制和 MuJoCo 验收步骤见
 [ZeroLab F2 Pro 现场接入与采集](ZEROLAB_F2_PRO.md)。
 
+- [Xsens MVN streaming and operation](XSENS_MVN.md)
+
 ## 状态和事件
 
 - `com.bxi.sonic/sonic_teleop`：控制机器人本体的 29 个策略关节；是否控制夹爪由
