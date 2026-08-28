@@ -18,6 +18,7 @@ from pico.zmq_messages import pack_pose_message
 from xsens.source_core import XsensReason
 from xsens_test_helpers import (
     FakeClock,
+    make_core,
     make_status,
     make_xsens_pose_fields,
     reserve_tcp_port,
@@ -323,6 +324,38 @@ def test_xsens_status_forwards_without_pose_and_preserves_all_fields(bridge_harn
     assert set(forwarded) == STATUS_KEYS
     for name, value in status.items():
         np.testing.assert_array_equal(forwarded[name], value)
+
+
+def test_real_source_startup_and_heartbeat_status_forward_fail_closed(
+    bridge_harness,
+):
+    core, clock = make_core(epoch_draws=(91, 92), now_ns=1_000_000_000)
+
+    startup = core.build_status_fields(clock.now_ns)
+    bridge_harness.input_status(startup)
+    bridge_harness.tick()
+    clock.advance_ns(20_000_000)
+    heartbeat = core.build_status_fields(clock.now_ns)
+    bridge_harness.input_status(heartbeat)
+    bridge_harness.tick()
+
+    assert bridge_harness.output.topics == ["xsens_status", "xsens_status"]
+    assert core.build_pose_fields() is None
+    for expected, (topic, forwarded) in zip(
+        (startup, heartbeat), bridge_harness.output.sent
+    ):
+        assert topic == "xsens_status"
+        assert int(forwarded["source_epoch"][0]) == 91
+        assert int(forwarded["producer_monotonic_ns"][0]) == 0
+        assert int(forwarded["newest_frame_index"][0]) == -1
+        assert not bool(forwarded["ready"][0])
+        assert not bool(forwarded["reference_window_ready"][0])
+        assert not bool(forwarded["source_stale"][0])
+        assert int(forwarded["accepted_arm_epoch"][0]) == 0
+        assert int(forwarded["reason_code"][0]) == XsensReason.NO_DATA
+        for name, value in expected.items():
+            np.testing.assert_array_equal(forwarded[name], value)
+    assert "smpl_ref" not in bridge_harness.output.topics
 
 
 def test_status_only_stale_edge_clears_pending_pose_immediately(bridge_harness):
@@ -686,16 +719,6 @@ def test_xsens_status_rejects_invalid_epoch_receipt_or_authorization_relationshi
             {"newest_frame_index": -1}, id="producer-with-sentinel-frame",
         ),
         pytest.param({"newest_frame_index": -2}, id="frame-below-sentinel"),
-        pytest.param(
-            {
-                "producer_monotonic_ns": 0,
-                "newest_frame_index": -1,
-                "ready": False,
-                "reference_window_ready": False,
-                "ready_frames": 0,
-            },
-            id="positive-epoch-with-no-data-sentinels",
-        ),
     ],
 )
 def test_xsens_status_rejects_producer_sentinel_mismatch_or_bad_index(changes):
@@ -703,20 +726,66 @@ def test_xsens_status_rejects_producer_sentinel_mismatch_or_bad_index(changes):
         _validate_xsens_status_fields(_status_with(**changes))
 
 
-def test_xsens_status_accepts_exact_no_data_sentinels():
+def test_xsens_status_accepts_positive_epoch_exact_no_data_sentinels():
     fields = _status_with(
-        source_epoch=0,
+        source_epoch=91,
         producer_monotonic_ns=0,
         newest_frame_index=-1,
         ready=False,
         reference_window_ready=False,
+        source_stale=False,
         ready_frames=0,
+        recovery_frames=0,
+        accepted_arm_epoch=0,
         reason_code=XsensReason.NO_DATA,
     )
     validated = _validate_xsens_status_fields(fields)
     assert set(validated) == STATUS_KEYS
     for name, value in fields.items():
         np.testing.assert_array_equal(validated[name], value)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"source_epoch": 0}, id="missing-process-epoch"),
+        pytest.param({"ready": True}, id="ready"),
+        pytest.param(
+            {"reference_window_ready": True}, id="reference-window-ready",
+        ),
+        pytest.param({"source_stale": True}, id="stale-without-data"),
+        pytest.param({"ready_frames": 1}, id="readiness-progress"),
+        pytest.param({"recovery_frames": 1}, id="recovery-progress"),
+        pytest.param(
+            {
+                "last_arm_command_id": 7,
+                "last_arm_target_epoch": 91,
+                "last_requested_arm_epoch": 91,
+                "accepted_arm_epoch": 91,
+            },
+            id="accepted-authorization",
+        ),
+    ],
+)
+def test_xsens_status_rejects_malformed_positive_epoch_no_data_states(changes):
+    fields = _status_with(
+        source_epoch=91,
+        producer_monotonic_ns=0,
+        newest_frame_index=-1,
+        ready=False,
+        reference_window_ready=False,
+        source_stale=False,
+        ready_frames=0,
+        recovery_frames=0,
+        accepted_arm_epoch=0,
+        reason_code=XsensReason.NO_DATA,
+    )
+    for name, scalar in changes.items():
+        dtype, shape = STATUS_SCHEMA[name]
+        assert shape == (1,)
+        fields[name] = np.array([scalar], dtype=dtype)
+    with pytest.raises(ValueError):
+        _validate_xsens_status_fields(fields)
 
 
 @pytest.mark.parametrize(

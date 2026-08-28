@@ -1487,6 +1487,207 @@ def test_operator_prompts_are_exact_and_reason_scoped(state_harness):
     assert state_harness.logger.infos.count(rearm_prompt) == 1
 
 
+def test_phase_diagnostics_expose_incident_audit_context_tokens(
+    state_harness,
+):
+    types = state_harness.types
+
+    def status(*, command_id=0, target=0, accepted=0, epoch=71):
+        return SimpleNamespace(
+            status_sequence=12,
+            received_monotonic=state_harness.clock.monotonic(),
+            reason_code=int(XsensReason.READY),
+            source_epoch=epoch,
+            last_arm_command_id=command_id,
+            last_arm_target_epoch=target,
+            last_requested_arm_epoch=accepted,
+            accepted_arm_epoch=accepted,
+            recovery_frames=0,
+        )
+
+    def request(*, requested=71, pre_sequence=4, ack_floor=None):
+        return SimpleNamespace(
+            requested_arm_epoch=requested,
+            pre_status_sequence=pre_sequence,
+            acknowledged_frame_index=ack_floor,
+        )
+
+    reference = SimpleNamespace(source_newest_frame_index=109)
+    cases = (
+        (
+            "waiting",
+            types.XsensPhase.WAITING_FOR_DATA,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            (
+                "hold_cause=none", "echoed_command_id=0",
+                "echoed_target_epoch=0", "pending_pre_status_sequence=0",
+                "ack_floor=none", "ack_floor_epoch=none",
+                "recovery_floor=none", "recovery_floor_epoch=none",
+                "yaw_owner=none",
+                "yaw_mode=none", "alignment_context=ineligible",
+            ),
+        ),
+        (
+            "pending",
+            types.XsensPhase.READY,
+            None,
+            None,
+            request(ack_floor=110),
+            status(command_id=7, target=71, accepted=71),
+            None,
+            False,
+            None,
+            (
+                "echoed_command_id=7", "echoed_target_epoch=71",
+                "pending_pre_status_sequence=4", "ack_floor=110",
+                "ack_floor_epoch=71",
+                "yaw_owner=none", "yaw_mode=reset",
+                "alignment_context=ineligible",
+            ),
+        ),
+        (
+            "live",
+            types.XsensPhase.LIVE,
+            types.XsensLinkStatus.FRESH,
+            None,
+            None,
+            status(command_id=7, target=71, accepted=71),
+            None,
+            True,
+            0.5,
+            (
+                "hold_cause=none", "yaw_owner=pending", "yaw_mode=reset",
+                "alignment_context=ineligible",
+            ),
+        ),
+        (
+            "hold",
+            types.XsensPhase.LIVE,
+            types.XsensLinkStatus.HOLD,
+            types.XsensHoldCause.PRODUCER_STALE,
+            None,
+            status(command_id=7, target=71, accepted=71),
+            112,
+            False,
+            None,
+            (
+                "hold_cause=PRODUCER_STALE", "recovery_floor=112",
+                "recovery_floor_epoch=71",
+                "yaw_owner=hold", "yaw_mode=preserve",
+                "alignment_context=same_epoch_hold",
+            ),
+        ),
+        (
+            "rearm",
+            types.XsensPhase.LIVE,
+            types.XsensLinkStatus.HOLD_REARM_REQUIRED,
+            None,
+            request(requested=72, pre_sequence=20),
+            status(command_id=8, target=72, epoch=72),
+            None,
+            False,
+            None,
+            (
+                "pending_pre_status_sequence=20", "ack_floor=none",
+                "yaw_owner=hold", "yaw_mode=reset",
+                "alignment_context=ineligible",
+            ),
+        ),
+        (
+            "alignment",
+            types.XsensPhase.LIVE,
+            types.XsensLinkStatus.FRESH,
+            None,
+            None,
+            status(command_id=7, target=71, accepted=71),
+            None,
+            False,
+            None,
+            (
+                "yaw_owner=active", "yaw_mode=preserve",
+                "alignment_context=fresh",
+            ),
+        ),
+    )
+
+    for (
+        label, phase, link, hold_cause, pending, current_status,
+        recovery_floor, blend, pending_yaw, expected_tokens,
+    ) in cases:
+        state_harness.state._phase = phase
+        state_harness.state._link_status = link
+        state_harness.state._hold_cause = hold_cause
+        state_harness.state._pending_request = pending
+        state_harness.state._disarm_retry_epoch = None
+        state_harness.state._recovery_frame_index = recovery_floor
+        state_harness.state._diagnostic_key = None
+        state_harness.policy.armed_source_epoch = (
+            71 if phase is types.XsensPhase.LIVE else None
+        )
+        state_harness.policy._source_blend_active = blend
+        state_harness.policy.pending_yaw_offset = pending_yaw
+        snapshot = SimpleNamespace(
+            status=current_status,
+            reference=reference if current_status is not None else None,
+        )
+
+        state_harness.state._emit_phase_diagnostic(
+            snapshot, state_harness.clock.monotonic()
+        )
+
+        message = next(
+            item for item in reversed(state_harness.logger.infos)
+            if item.startswith("Xsens phase=")
+        )
+        for token in expected_tokens:
+            assert token in message, f"{label}: missing {token!r} in {message!r}"
+
+
+def test_phase_diagnostics_retain_floors_after_immediate_gate_open(
+    state_harness,
+):
+    def latest_phase_log():
+        return next(
+            item for item in reversed(state_harness.logger.infos)
+            if item.startswith("Xsens phase=")
+        )
+
+    state_harness.enter_live(epoch=71, newest_frame=110)
+    assert "ack_floor=111" in latest_phase_log()
+    assert "ack_floor_epoch=71" in latest_phase_log()
+
+    state_harness.publish_status(
+        sequence=30, epoch=71, accepted=71, newest_frame=111,
+        ready=False, reference_window_ready=False, source_stale=True,
+        recovery_frames=0, reason_code=XsensReason.ARMED_STALE,
+    )
+    state_harness.tick()
+    assert state_harness.state.link_status is state_harness.types.XsensLinkStatus.HOLD
+    state_harness.publish_status(
+        sequence=31, epoch=71, accepted=71, newest_frame=112,
+        ready=True, reference_window_ready=True, recovery_frames=10,
+        reason_code=XsensReason.ARMED_RECOVERING,
+    )
+    state_harness.publish_reference(epoch=71, newest_frame=112)
+    state_harness.tick()
+
+    assert state_harness.state.link_status is state_harness.types.XsensLinkStatus.FRESH
+    assert "recovery_floor=112" in latest_phase_log()
+    assert "recovery_floor_epoch=71" in latest_phase_log()
+
+    state_harness.exit()
+    assert state_harness.state._last_ack_frame_floor is None
+    assert state_harness.state._last_ack_floor_epoch is None
+    assert state_harness.state._last_recovery_frame_floor is None
+    assert state_harness.state._last_recovery_floor_epoch is None
+
+
 def test_initial_prompt_uses_eligibility_rising_edge_not_diagnostic_key(
     state_harness,
 ):

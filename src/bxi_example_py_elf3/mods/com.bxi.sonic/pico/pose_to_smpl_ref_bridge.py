@@ -451,6 +451,8 @@ def _validate_xsens_status_fields(
 
     accepted_epoch = values["accepted_arm_epoch"]
     source_epoch = values["source_epoch"]
+    if source_epoch <= 0:
+        raise ValueError("source_epoch must be positive")
     if accepted_epoch not in (0, source_epoch):
         raise ValueError("accepted_arm_epoch must equal source_epoch")
     if accepted_epoch > 0 and (source_epoch <= 0 or command_id <= 0):
@@ -463,12 +465,15 @@ def _validate_xsens_status_fields(
         raise ValueError("producer_monotonic_ns/newest_frame_index sentinel mismatch")
     if no_data:
         if (
-            source_epoch != 0
+            accepted_epoch != 0
             or values["ready"]
             or values["reference_window_ready"]
+            or values["source_stale"]
+            or values["ready_frames"] != 0
+            or values["recovery_frames"] != 0
         ):
-            raise ValueError("no-data status has invalid epoch or readiness")
-    elif producer_ns <= 0 or newest_frame < 0 or source_epoch <= 0:
+            raise ValueError("no-data status is not fail-closed")
+    elif producer_ns <= 0 or newest_frame < 0:
         raise ValueError("data-present status requires positive source metadata")
 
     if values["source_stale"] and (

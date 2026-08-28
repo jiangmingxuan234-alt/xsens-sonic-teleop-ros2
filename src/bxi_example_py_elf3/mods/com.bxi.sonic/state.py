@@ -702,6 +702,10 @@ class XsensSonicTeleopState(SonicTeleopState):
         self._diagnostic_key = None
         self._prompt_eligibility = None
         self._recovery_frame_index = None
+        self._last_ack_frame_floor = None
+        self._last_ack_floor_epoch = None
+        self._last_recovery_frame_floor = None
+        self._last_recovery_floor_epoch = None
 
     def on_enter(self, ctx: RobotControlContext) -> None:
         self._entered = True
@@ -737,6 +741,10 @@ class XsensSonicTeleopState(SonicTeleopState):
                 self._disarm_retry_epoch = None
                 self._neutral_latch_open = False
                 self._prompt_eligibility = None
+                self._last_ack_frame_floor = None
+                self._last_ack_floor_epoch = None
+                self._last_recovery_frame_floor = None
+                self._last_recovery_floor_epoch = None
                 super().on_exit(ctx)
 
     def _draw_command_id(self) -> int:
@@ -943,6 +951,10 @@ class XsensSonicTeleopState(SonicTeleopState):
         self._ready_frames = status.ready_frames
         self._rearm_ready = False
         self._recovery_frame_index = None
+        self._last_ack_frame_floor = None
+        self._last_ack_floor_epoch = None
+        self._last_recovery_frame_floor = None
+        self._last_recovery_floor_epoch = None
         self._pending_request = None
         self._disarm_retry_epoch = None
         if self._current_source_epoch is None:
@@ -1049,6 +1061,8 @@ class XsensSonicTeleopState(SonicTeleopState):
                 acknowledged_frame_index=status.newest_frame_index,
             )
             self._pending_request = request
+            self._last_ack_frame_floor = status.newest_frame_index
+            self._last_ack_floor_epoch = status.source_epoch
         frame_index = request.acknowledged_frame_index
         if frame_index is None:
             return
@@ -1126,6 +1140,8 @@ class XsensSonicTeleopState(SonicTeleopState):
             self._link_status = XsensLinkStatus.HOLD
             self._hold_cause = cause or XsensHoldCause.PRODUCER_STALE
             self._recovery_frame_index = None
+            self._last_recovery_frame_floor = None
+            self._last_recovery_floor_epoch = None
             return
 
         if self._link_status is not XsensLinkStatus.HOLD:
@@ -1147,6 +1163,8 @@ class XsensSonicTeleopState(SonicTeleopState):
             self._recovery_frame_index = status.newest_frame_index
         floor = self._recovery_frame_index
         assert floor is not None and epoch is not None
+        self._last_recovery_frame_floor = floor
+        self._last_recovery_floor_epoch = epoch
         if not self._canonical_join(
             snapshot,
             epoch=epoch,
@@ -1231,6 +1249,23 @@ class XsensSonicTeleopState(SonicTeleopState):
             return XsensReason.NO_DATA.name
         return XsensReason(snapshot.status.reason_code).name
 
+    def _alignment_context(
+        self,
+    ) -> Literal["fresh", "same_epoch_hold", "rearm_hold"] | None:
+        if (
+            self._phase is not XsensPhase.LIVE
+            or self.arm_pending
+            or self.rearm_pending
+            or self.policy.source_blend_active
+            or self.policy.pending_yaw_offset is not None
+        ):
+            return None
+        return {
+            XsensLinkStatus.FRESH: "fresh",
+            XsensLinkStatus.HOLD: "same_epoch_hold",
+            XsensLinkStatus.HOLD_REARM_REQUIRED: "rearm_hold",
+        }.get(self._link_status)
+
     def on_action(
         self,
         ctx: RobotControlContext,
@@ -1239,19 +1274,7 @@ class XsensSonicTeleopState(SonicTeleopState):
         if action_name not in {"activate_xsens", "reset_alignment"}:
             return False
         if action_name == "reset_alignment":
-            context = None
-            if (
-                self._phase is XsensPhase.LIVE
-                and not self.arm_pending
-                and not self.rearm_pending
-                and not self.policy.source_blend_active
-                and self.policy.pending_yaw_offset is None
-            ):
-                context = {
-                    XsensLinkStatus.FRESH: "fresh",
-                    XsensLinkStatus.HOLD: "same_epoch_hold",
-                    XsensLinkStatus.HOLD_REARM_REQUIRED: "rearm_hold",
-                }.get(self._link_status)
+            context = self._alignment_context()
             if context is None or not self.policy.reset_xsens_alignment(context):
                 self.logger.warning(
                     "Xsens alignment reset rejected in "
@@ -1320,6 +1343,8 @@ class XsensSonicTeleopState(SonicTeleopState):
             now=now,
         )
         if request is not None:
+            self._last_ack_frame_floor = None
+            self._last_ack_floor_epoch = None
             self._pending_request = request
         return True
 
@@ -1401,6 +1426,60 @@ class XsensSonicTeleopState(SonicTeleopState):
             if status is None
             else now - status.received_monotonic
         )
+        hold_cause = (
+            "none" if self._hold_cause is None else self._hold_cause.value
+        )
+        echoed_command_id = (
+            0 if status is None else status.last_arm_command_id
+        )
+        echoed_target_epoch = (
+            0 if status is None else status.last_arm_target_epoch
+        )
+        pending_pre_status_sequence = (
+            0 if request is None else request.pre_status_sequence
+        )
+        ack_floor = (
+            self._last_ack_frame_floor
+            if request is None or request.acknowledged_frame_index is None
+            else request.acknowledged_frame_index
+        )
+        ack_floor_epoch = (
+            self._last_ack_floor_epoch
+            if request is None or request.acknowledged_frame_index is None
+            else None if status is None else status.source_epoch
+        )
+        recovery_floor = (
+            self._last_recovery_frame_floor
+            if self._recovery_frame_index is None
+            else self._recovery_frame_index
+        )
+        recovery_floor_epoch = (
+            self._last_recovery_floor_epoch
+            if self._recovery_frame_index is None
+            else None if status is None else status.source_epoch
+        )
+        if self._link_status in {
+            XsensLinkStatus.HOLD,
+            XsensLinkStatus.HOLD_REARM_REQUIRED,
+        }:
+            yaw_owner = "hold"
+        elif self.policy.pending_yaw_offset is not None:
+            yaw_owner = "pending"
+        elif self.policy.armed_source_epoch is not None:
+            yaw_owner = "active"
+        else:
+            yaw_owner = "none"
+        if (
+            (request is not None and request.requested_arm_epoch != 0)
+            or self._link_status is XsensLinkStatus.HOLD_REARM_REQUIRED
+            or self.policy.pending_yaw_offset is not None
+        ):
+            yaw_mode = "reset"
+        elif self._phase is XsensPhase.LIVE:
+            yaw_mode = "preserve"
+        else:
+            yaw_mode = "none"
+        alignment_context = self._alignment_context()
         self.logger.info(
             "Xsens phase="
             f"{self._phase.value} link="
@@ -1419,7 +1498,20 @@ class XsensSonicTeleopState(SonicTeleopState):
             f"pending={pending_kind or 'none'} "
             f"joined_frame="
             f"{None if snapshot.reference is None else snapshot.reference.source_newest_frame_index} "
-            f"blend={self.policy.source_blend_active}"
+            f"blend={self.policy.source_blend_active} "
+            f"hold_cause={hold_cause} "
+            f"echoed_command_id={echoed_command_id} "
+            f"echoed_target_epoch={echoed_target_epoch} "
+            f"pending_pre_status_sequence={pending_pre_status_sequence} "
+            f"ack_floor={'none' if ack_floor is None else ack_floor} "
+            f"ack_floor_epoch="
+            f"{'none' if ack_floor_epoch is None else ack_floor_epoch} "
+            f"recovery_floor="
+            f"{'none' if recovery_floor is None else recovery_floor} "
+            f"recovery_floor_epoch="
+            f"{'none' if recovery_floor_epoch is None else recovery_floor_epoch} "
+            f"yaw_owner={yaw_owner} yaw_mode={yaw_mode} "
+            f"alignment_context={alignment_context or 'ineligible'}"
         )
 
 
